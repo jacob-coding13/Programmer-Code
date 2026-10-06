@@ -1,0 +1,12 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+build/
+dist/
+*.spec
+settings_*.json
+.programmer_code_folds.json
+
+*.iml
