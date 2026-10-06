@@ -23,6 +23,7 @@ from developer_mode import is_developer_machine
 from settings_dialog import SettingsDialog
 from terminal import Terminal
 from theme_manager import get_app_style
+from version import VERSION
 
 class MainWindow(QMainWindow):
 
@@ -45,7 +46,9 @@ class MainWindow(QMainWindow):
             self.project.path / ".programmer_code_folds.json"
         )
 
-        self.setWindowTitle(f"Programmer Code - {self.project.name}")
+        self.setWindowTitle(
+            f"Programmer Code {VERSION} - {self.project.name}"
+        )
         self.explorer.set_folder(str(self.project.path))
 
         self.setup_signals()
