@@ -24,6 +24,7 @@ from settings_dialog import SettingsDialog
 from terminal import Terminal
 from theme_manager import get_app_style
 from version import VERSION
+from update_checker import UpdateChecker
 
 class MainWindow(QMainWindow):
 
@@ -31,6 +32,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.settings = settings
+        self.update_checker = UpdateChecker()
         self.lang = LanguageManager(self.settings.language)
         self.project = Project()
 
@@ -70,6 +72,11 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(
             100,
             self.update_all_sticky_lines
+        )
+
+        QTimer.singleShot(
+            2000,
+            self.check_for_updates
         )
 
     def setup_signals(self):
@@ -442,3 +449,14 @@ class MainWindow(QMainWindow):
             "Update",
             "Update-System wird vorbereitet."
         )
+
+    def check_for_updates(self):
+        if self.update_checker.check():
+            QMessageBox.information(
+                self,
+                "Update verfügbar",
+                (
+                    f"Eine neue Version ist verfügbar:\n\n"
+                    f"Version {self.update_checker.latest_version}"
+                )
+            )

@@ -1,6 +1,11 @@
 from pathlib import Path
 from PySide6.QtCore import Signal, QItemSelectionModel, QDir
-from PySide6.QtWidgets import QFileSystemModel, QTreeView
+from PySide6.QtWidgets import (
+    QFileSystemModel,
+    QTreeView,
+    QFileIconProvider,
+)
+from PySide6.QtGui import QIcon
 
 class Explorer(QTreeView):
 
@@ -14,6 +19,12 @@ class Explorer(QTreeView):
         self.file_model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot)
 
         self.file_model.directoryLoaded.connect(self._on_directory_loaded)
+
+        self.file_model = QFileSystemModel()
+
+        self.file_model.setIconProvider(
+            ProgrammerCodeIconProvider()
+        )
 
         self.setModel(self.file_model)
 
@@ -58,3 +69,26 @@ class Explorer(QTreeView):
             QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows
         )
         self.scrollTo(index)
+
+class ProgrammerCodeIconProvider(QFileIconProvider):
+
+    def __init__(self):
+        super().__init__()
+
+        icon_path = (
+                Path(__file__).parent
+                / "resources"
+                / "icons"
+                / "programmer_code.png"
+        )
+
+        self.programmer_icon = QIcon(str(icon_path))
+
+    def icon(self, info):
+        if (
+                info.isFile()
+                and info.suffix().lower() == "py"
+        ):
+            return self.programmer_icon
+
+        return super().icon(info)
