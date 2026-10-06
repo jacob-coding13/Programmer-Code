@@ -129,7 +129,7 @@ class Settings:
     }
 
     def __init__(self, path=None):
-        self.path = Path(path) if path else Path(__file__).parent / "settings_PythonX.json"
+        self.path = Path(path) if path else Path(__file__).parent / "settings_ProgrammerCode.json"
         self.data = copy.deepcopy(self.DEFAULTS)
         self.load()
 
