@@ -1,6 +1,12 @@
 from pathlib import Path
 from sys import path
 import sys
+import os
+import shutil
+import subprocess
+import tempfile
+import zipfile
+import urllib.request
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence
@@ -50,7 +56,7 @@ class MainWindow(QMainWindow):
                     Path(sys.executable).parent
                     / "ProgrammerCodeFiles"
             )
-        
+
             default_project_dir.mkdir(
                 parents=True,
                 exist_ok=True
@@ -469,13 +475,134 @@ class MainWindow(QMainWindow):
             "Update-System wird vorbereitet."
         )
 
-    def check_for_updates(self):
-        if self.update_checker.check():
-            QMessageBox.information(
+    def download_update(self):
+        url = self.update_checker.download_url
+
+        if not url:
+            QMessageBox.warning(
                 self,
-                "Update verfügbar",
-                (
-                    f"Eine neue Version ist verfügbar:\n\n"
-                    f"Version {self.update_checker.latest_version}"
+                "Update",
+                "Die Update-Datei wurde nicht gefunden."
+            )
+            return
+
+        try:
+            update_root = Path(
+                tempfile.mkdtemp(
+                    prefix="programmer_code_update_"
                 )
             )
+
+            zip_path = update_root / "update.zip"
+
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Programmer-Code"
+                }
+            )
+
+            with urllib.request.urlopen(
+                    request,
+                    timeout=60
+            ) as response:
+
+                with zip_path.open("wb") as file:
+                    shutil.copyfileobj(
+                        response,
+                        file
+                    )
+
+            extract_directory = (
+                    update_root / "extracted"
+            )
+
+            extract_directory.mkdir()
+
+            with zipfile.ZipFile(
+                    zip_path,
+                    "r"
+            ) as archive:
+
+                archive.extractall(
+                    extract_directory
+                )
+
+            old_directory = Path(
+                sys.executable
+            ).parent
+
+            directories = [
+                path
+                for path in extract_directory.iterdir()
+                if path.is_dir()
+            ]
+
+            if len(directories) != 1:
+                raise RuntimeError(
+                    "Ungültige Update-Struktur."
+                )
+
+            new_directory = directories[0]
+
+            updater_source = (
+                    Path(__file__).parent
+                    / "updater.py"
+            )
+
+            updater_copy = (
+                    update_root
+                    / "updater.py"
+            )
+
+            shutil.copy2(
+                updater_source,
+                updater_copy
+            )
+
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    str(updater_copy),
+                    str(old_directory),
+                    str(new_directory),
+                    Path(sys.executable).name
+                ],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+
+            QApplication.quit()
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Update fehlgeschlagen",
+                (
+                    "Das Update konnte nicht installiert werden.\n\n"
+                    f"{e}"
+                )
+            )
+    def check_for_updates(self):
+        if not getattr(sys, "frozen", False):
+            return
+
+        if not self.update_checker.check():
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Update verfügbar",
+            (
+                f"Eine neue Version von Programmer Code ist verfügbar.\n\n"
+                f"Aktuelle Version: {VERSION}\n"
+                f"Neue Version: {self.update_checker.latest_version}\n\n"
+                f"Möchtest du das Update jetzt herunterladen?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        self.download_update()

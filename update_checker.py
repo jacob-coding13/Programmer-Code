@@ -1,5 +1,5 @@
-import urllib.request
 import json
+import urllib.request
 
 from version import VERSION
 
@@ -9,12 +9,15 @@ GITHUB_API_URL = (
     "jacob-coding13/Programmer-Code/releases/latest"
 )
 
+UPDATE_ASSET_NAME = "Programmer-Code.zip"
+
 
 class UpdateChecker:
 
     def __init__(self):
         self.latest_version = None
         self.download_url = None
+        self.release_url = None
 
     def check(self):
         try:
@@ -27,7 +30,7 @@ class UpdateChecker:
 
             with urllib.request.urlopen(
                     request,
-                    timeout=5
+                    timeout=10
             ) as response:
 
                 data = json.loads(
@@ -42,21 +45,27 @@ class UpdateChecker:
             latest = tag.lstrip("v")
 
             self.latest_version = latest
+            self.release_url = data.get("html_url")
 
-            if self.is_newer(latest, VERSION):
-                assets = data.get("assets", [])
+            assets = data.get("assets", [])
 
-                if assets:
-                    self.download_url = assets[0].get(
+            for asset in assets:
+                if asset.get("name") == UPDATE_ASSET_NAME:
+                    self.download_url = asset.get(
                         "browser_download_url"
                     )
+                    break
 
-                return True
+            if not self.download_url:
+                return False
+
+            return self.is_newer(
+                latest,
+                VERSION
+            )
 
         except Exception:
-            pass
-
-        return False
+            return False
 
     def is_newer(self, latest, current):
         try:
