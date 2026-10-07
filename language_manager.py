@@ -1,6 +1,8 @@
 import json
 import sys
 from pathlib import Path
+
+
 class LanguageManager:
 
     def __init__(self, language="en"):
@@ -9,7 +11,7 @@ class LanguageManager:
         self.fallback_data = {}
 
         if getattr(sys, "frozen", False):
-            base_dir = Path(sys.executable).parent
+            base_dir = Path(sys.executable).parent / "_internal"
         else:
             base_dir = Path(__file__).parent
 

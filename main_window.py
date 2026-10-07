@@ -1,5 +1,6 @@
 from pathlib import Path
 from sys import path
+import sys
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence
@@ -42,7 +43,25 @@ class MainWindow(QMainWindow):
         self.outline = Outline(self.settings)
         self.terminal = Terminal(self.settings)
 
-        default_project_dir = Path(__file__).parent.resolve()
+        self.project = Project()
+
+        if getattr(sys, "frozen", False):
+            default_project_dir = (
+                    Path(sys.executable).parent
+                    / "ProgrammerCodeFiles"
+            )
+        
+            default_project_dir.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+        else:
+            default_project_dir = Path(__file__).parent.resolve()
+
+        self.project.open(str(default_project_dir))
+
+        self.project.open(str(default_project_dir))
+
         self.project.open(str(default_project_dir))
         self.editor_tabs.load_file_states(
             self.project.path / ".programmer_code_folds.json"
