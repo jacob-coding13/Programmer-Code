@@ -264,7 +264,9 @@ class MainWindow(QMainWindow):
     def open_project(self, path):
         self.project.open(path)
         self.explorer.set_folder(str(self.project.path))
-        self.setWindowTitle(f"PythonX - {self.project.name}")
+        self.setWindowTitle(
+            f"Programmer Code {VERSION} - {self.project.name}"
+        )
 
     def run_current_file(self):
         self.editor_tabs.run_current(self.terminal)
@@ -297,12 +299,20 @@ class MainWindow(QMainWindow):
         )
         self.setFont(font)
 
-        QApplication.instance().setStyleSheet(get_app_style(self.settings))
+        QApplication.instance().setStyleSheet(
+            get_app_style(self.settings)
+        )
 
         for i in range(self.editor_tabs.count()):
             editor = self.editor_tabs.widget(i)
+
             if editor:
                 editor.settings = self.settings
+
+                if hasattr(editor, "highlighter"):
+                    editor.highlighter.update_formats()
+                    editor.highlighter.rehighlight()
+
                 editor.apply_settings()
 
         self.terminal.settings = self.settings
@@ -312,8 +322,11 @@ class MainWindow(QMainWindow):
         self.outline.update()
 
         self.timer.stop()
+
         if self.settings.auto_save and not self.settings.smart_save:
-            self.timer.start(self.settings.auto_save_interval * 1000)
+            self.timer.start(
+                self.settings.auto_save_interval * 1000
+            )
 
         self.update()
 
@@ -426,7 +439,9 @@ class MainWindow(QMainWindow):
             toolbar.deleteLater()
 
         self.create_toolbar()
-        self.setWindowTitle(f"Programmer Code - {self.project.name}")
+        self.setWindowTitle(
+            f"Programmer Code {VERSION} - {self.project.name}"
+        )
         self.statusBar().showMessage(self.lang.get("ready"))
 
         self.terminal.reload_language()
