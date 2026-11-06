@@ -1,4 +1,6 @@
 import sys
+from calendar import error
+from pathlib import Path
 
 from PySide6.QtCore import QProcess, Signal, Qt
 from PySide6.QtGui import QFont, QTextCursor, QColor, QTextCharFormat, QKeyEvent
@@ -90,20 +92,66 @@ class Terminal(QPlainTextEdit):
             )
             return
 
+        path = Path(file).resolve()
+
+        if not path.is_file:
+            return
+
+        suffix = path.suffix.lower()
+
+        if suffix not in (".py", ".java"):
+            self.write(
+                error = True
+            )
+            return
+
         if self.process.state() != QProcess.NotRunning:
             self.process.kill()
             self.process.waitForFinished(1000)
 
         self.clear_output()
 
-        running = self.lang.get("running")
-        self.write(f"> {running} {file}...\n")
-
-        interpreter = getattr(self.settings, "python_interpreter", None) or sys.executable
-        self.setReadOnly(False)
         self.input_start = self.document().characterCount() - 1
         self.user_has_input = False
-        self.process.start(interpreter, ["-u", file])
+
+        if suffix == ".py":
+            interpreter = (
+                getattr(self.settings, "python_interpreter", None)
+                or sys.executable
+            )
+
+            running = self.lang.get("running")
+            self.write(f"> {running} {file}...\n")
+
+            self.process.setWorkingDirectory(str(path.parent))
+            self.process.start(
+                interpreter,
+                ["-u", str(path)]
+            )
+
+        elif suffix == ".java":
+            self.run_java(path)
+
+    def run_java(self, path):
+        self.java_file = path
+        self.java_class_name = path.stem
+
+        self.process.setWorkingDirectory(str(path.parent))
+
+        self.java_mode = "compile"
+        self.process.start(
+            "javac",
+            [str(path)]
+        )
+
+    def start_java_programm(self):
+        self.java_mode = "run"
+        self.process.setWorkingDirectory(str(self.java_file.parent))
+
+        self.process.start(
+            "java",
+            ["-cp", str(self.java_file.parent), self.java_class_name]
+        )
 
     def read_stdout(self):
         data = self.process.readAllStandardOutput()
@@ -163,11 +211,27 @@ class Terminal(QPlainTextEdit):
         if not self.user_has_input:
             self.input_start = self.document().characterCount() - 1
 
-    def process_finished(self):
+    def process_finished(self, exit_code = 0, exit_status = None):
+        if getattr(self, "java_mode", None) == "compile":
+            if exit_code != 0:
+                self.java_mode = None
+                self.write(
+                    error=True
+                )
+
+                self.finished.emit()
+                return
+
+            self.start_java_programm()
+            return
+
+        self.java_mode = None
+        self.user_has_input = False
+
         msg = self.lang.get("process_finished")
         self.setReadOnly(True)
-        self.user_has_input = False
-        self.write(f"\n> {msg}\n", error=False)
+        self.write(f"\n> {msg}\n")
+
         self.input_start = self.document().characterCount() - 1
         self.finished.emit()
 

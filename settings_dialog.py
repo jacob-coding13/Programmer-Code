@@ -11,7 +11,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QSpinBox,
     QCheckBox,
-    QDoubleSpinBox
+    QDoubleSpinBox,
+    QScrollArea
 )
 
 from color_button import ColorButton
@@ -63,6 +64,7 @@ class SettingsDialog(QDialog):
             [
                 self.lang.get("language"),
                 self.lang.get("editor"),
+                self.lang.get("syntax_highlighting"),
                 self.lang.get("appearance"),
                 self.lang.get("terminal"),
                 self.lang.get("files"),
@@ -87,6 +89,10 @@ class SettingsDialog(QDialog):
 
         self.pages.addWidget(
             self.editor_page()
+        )
+
+        self.pages.addWidget(
+            self.syntax_highlighting_page()
         )
 
         self.pages.addWidget(
@@ -159,6 +165,26 @@ class SettingsDialog(QDialog):
         self.categories.setCurrentRow(
             0
         )
+
+    def create_syntax_color_button(self, layout, label, key):
+            layout.addWidget(
+                QLabel(label)
+            )
+
+            button = ColorButton()
+
+            color = self.settings.get(
+                f"editor.syntax_colors.{key}",
+                "#ffffff"
+            )
+
+            button.set_value(color)
+
+            layout.addWidget(
+                button
+            )
+
+            return button
 
     def filter_settings(self, text):
         query = text.strip().casefold()
@@ -252,7 +278,12 @@ class SettingsDialog(QDialog):
 
         page = QWidget()
 
-        layout = QVBoxLayout(page)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
         title = QLabel(
             self.lang.get("editor")
@@ -360,10 +391,23 @@ class SettingsDialog(QDialog):
         )
 
         self.scroll_speed = QDoubleSpinBox()
-        self.scroll_speed.setRange(0.1, 5.0)
-        self.scroll_speed.setSingleStep(0.1)
-        self.scroll_speed.setValue(self.settings.scroll_speed)
-        self.scroll_speed.setSuffix("×")
+
+        self.scroll_speed.setRange(
+            0.1,
+            5.0
+        )
+
+        self.scroll_speed.setSingleStep(
+            0.1
+        )
+
+        self.scroll_speed.setValue(
+            self.settings.scroll_speed
+        )
+
+        self.scroll_speed.setSuffix(
+            "×"
+        )
 
         self.minimap = QCheckBox(
             self.lang.get("show_minimap")
@@ -420,6 +464,160 @@ class SettingsDialog(QDialog):
         )
 
         layout.addStretch()
+
+        scroll.setWidget(
+            content
+        )
+
+        page_layout = QVBoxLayout(page)
+
+        page_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0
+        )
+
+        page_layout.addWidget(
+            scroll
+        )
+
+        return page
+
+    def syntax_highlighting_page(self):
+
+        page = QWidget()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+
+        content = QWidget()
+
+        layout = QVBoxLayout(content)
+
+        title = QLabel(
+            self.lang.get("syntax_highlighting")
+        )
+
+        title.setStyleSheet(
+            """
+            font-size:18px;
+            font-weight:bold;
+            """
+        )
+
+        layout.addWidget(title)
+
+        self.syntax_keyword = self.create_syntax_color_button(
+            layout,
+            self.lang.get("keywords"),
+            "keyword"
+        )
+
+        self.syntax_string = self.create_syntax_color_button(
+            layout,
+            self.lang.get("strings"),
+            "string"
+        )
+
+        self.syntax_comment = self.create_syntax_color_button(
+            layout,
+            self.lang.get("comments"),
+            "comment"
+        )
+
+        self.syntax_number = self.create_syntax_color_button(
+            layout,
+            self.lang.get("numbers"),
+            "number"
+        )
+
+        self.syntax_function = self.create_syntax_color_button(
+            layout,
+            self.lang.get("functions"),
+            "function"
+        )
+
+        self.syntax_class = self.create_syntax_color_button(
+            layout,
+            self.lang.get("classes"),
+            "class"
+        )
+
+        self.syntax_decorator = self.create_syntax_color_button(
+            layout,
+            self.lang.get("decorators"),
+            "decorator"
+        )
+
+        self.syntax_builtin = self.create_syntax_color_button(
+            layout,
+            self.lang.get("builtins"),
+            "builtin"
+        )
+
+        self.syntax_self = self.create_syntax_color_button(
+            layout,
+            self.lang.get("self"),
+            "self"
+        )
+
+        self.syntax_todo = self.create_syntax_color_button(
+            layout,
+            self.lang.get("todo"),
+            "todo"
+        )
+
+        layout.addWidget(
+            QLabel(
+                self.lang.get("brackets")
+            )
+        )
+
+        self.syntax_bracket_1 = self.create_syntax_color_button(
+            layout,
+            self.lang.get("bracket_color_1"),
+            "brackets_1"
+        )
+
+        self.syntax_bracket_2 = self.create_syntax_color_button(
+            layout,
+            self.lang.get("bracket_color_2"),
+            "brackets_2"
+        )
+
+        self.syntax_bracket_3 = self.create_syntax_color_button(
+            layout,
+            self.lang.get("bracket_color_3"),
+            "brackets_3"
+        )
+
+        self.syntax_bracket_4 = self.create_syntax_color_button(
+            layout,
+            self.lang.get("bracket_color_4"),
+            "brackets_4"
+        )
+
+        self.syntax_bracket_5 = self.create_syntax_color_button(
+            layout,
+            self.lang.get("bracket_color_5"),
+            "brackets_5"
+        )
+
+        layout.addStretch()
+
+        scroll.setWidget(content)
+
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0
+        )
+
+        page_layout.addWidget(scroll)
 
         return page
 
@@ -784,6 +982,30 @@ class SettingsDialog(QDialog):
 
         self.settings.developer_mode = self.developer_mode.isChecked()
         self.settings.logging = self.logging.isChecked()
+
+        syntax_colors = {
+            "keyword": self.syntax_keyword.value(),
+            "string": self.syntax_string.value(),
+            "comment": self.syntax_comment.value(),
+            "number": self.syntax_number.value(),
+            "function": self.syntax_function.value(),
+            "class": self.syntax_class.value(),
+            "decorator": self.syntax_decorator.value(),
+            "builtin": self.syntax_builtin.value(),
+            "self": self.syntax_self.value(),
+            "todo": self.syntax_todo.value(),
+            "brackets_1": self.syntax_bracket_1.value(),
+            "brackets_2": self.syntax_bracket_2.value(),
+            "brackets_3": self.syntax_bracket_3.value(),
+            "brackets_4": self.syntax_bracket_4.value(),
+            "brackets_5": self.syntax_bracket_5.value(),
+        }
+
+        self.settings.set(
+            "editor.syntax_colors",
+            syntax_colors,
+            save_immediately=False
+        )
 
         self.settings.save()
         self.accept()

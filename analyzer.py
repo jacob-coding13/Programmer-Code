@@ -1,12 +1,24 @@
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-class PythonAnalyzer:
 
+class PythonAnalyzer:
     def analyze(self, code):
+        return self._analyze_python(code)
+
+    def analyze_errors(self, code):
+        errors, _ = self.analyze(code)
+        return errors
+
+    def analyze_warnings(self, code):
+        _, warnings = self.analyze(code)
+        return warnings
+
+    def _analyze_python(self, code):
         errors = []
         warnings = []
         filename = None
@@ -17,90 +29,217 @@ class PythonAnalyzer:
                     delete=False,
                     mode="w",
                     encoding="utf-8",
+                    newline="\n",
             ) as file:
                 file.write(code)
                 filename = file.name
 
-            ruff_command = self.get_ruff_command()
+            command = self.get_ruff_command()
 
-            if not ruff_command:
+            if not command:
+                warnings.append(
+                    (0, 0, 0, 0, "Ruff wurde nicht gefunden.")
+                )
                 return errors, warnings
 
             result = subprocess.run(
-                ruff_command + [
+                command + [
                     "check",
-                    filename,
                     "--output-format=json",
+                    "--stdin-filename",
+                    filename,
+                    "-",
+                ],
+                input=code,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                )
+
+            if result.returncode not in (0, 1):
+                message = result.stderr.strip() or "Ruff-Analyse fehlgeschlagen."
+                warnings.append((0, 0, 0, 0, message))
+                return errors, warnings
+
+            try:
+                diagnostics = json.loads(result.stdout or "[]")
+            except json.JSONDecodeError:
+                warnings.append(
+                    (0, 0, 0, 0, "Ungültige Antwort von Ruff.")
+                )
+                return errors, warnings
+
+            for item in diagnostics:
+                code_id = item.get("code") or "UNKNOWN"
+                location = item.get("location") or {}
+                end_location = item.get("end_location") or location
+
+                diagnostic = (
+                    max(0, location.get("row", 1) - 1),
+                    max(0, location.get("column", 1) - 1),
+                    max(0, end_location.get("row", 1) - 1),
+                    max(0, end_location.get("column", 1) - 1),
+                    f"{code_id}: {item.get('message', 'Unbekannter Fehler')}",
+                )
+
+                if self._is_error(item):
+                    errors.append(diagnostic)
+                else:
+                    warnings.append(diagnostic)
+
+        except subprocess.TimeoutExpired:
+            warnings.append((0, 0, 0, 0, "Ruff-Analyse hat zu lange gedauert."))
+        except OSError as exc:
+            warnings.append((0, 0, 0, 0, f"Ruff konnte nicht gestartet werden: {exc}"))
+        finally:
+            if filename:
+                try:
+                    Path(filename).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        return errors, warnings
+
+    def _is_error(self, diagnostic):
+        code_id = diagnostic.get("code") or ""
+        return (
+                diagnostic.get("severity") == "error"
+                or code_id == "invalid-syntax"
+                or code_id == "F821"
+                or code_id.startswith("E9")
+        )
+
+    def get_ruff_command(self):
+        if not getattr(sys, "frozen", False):
+            return [sys.executable, "-m", "ruff"]
+
+        base_path = Path(sys.executable).parent
+        candidates = [
+            base_path / "ruff.exe",
+            base_path / "_internal" / "ruff.exe",
+            ]
+
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "ruff.exe")
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return [str(candidate)]
+
+        return None
+
+
+class JavaAnalyzer:
+
+    def __init__(self, checkstyle_jar=None, config_file=None):
+        self.checkstyle_jar = Path(checkstyle_jar) if checkstyle_jar else None
+        self.config_file = Path(config_file) if config_file else None
+
+    def analyze(self, code):
+        errors = []
+        warnings = []
+        filename = None
+
+        if not self.checkstyle_jar or not self.checkstyle_jar.is_file():
+            warnings.append(
+                (
+                    0, 0, 0, 0,
+                    "Java-Analyse nicht eingerichtet: Checkstyle-JAR fehlt.",
+                )
+            )
+            return errors, warnings
+
+        if not self.config_file or not self.config_file.is_file():
+            warnings.append(
+                (
+                    0, 0, 0, 0,
+                    "Java-Analyse nicht eingerichtet: Checkstyle-Konfiguration fehlt.",
+                )
+            )
+            return errors, warnings
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                    suffix=".java",
+                    delete=False,
+                    mode="w",
+                    encoding="utf-8",
+                    newline="\n",
+            ) as file:
+                file.write(code)
+                filename = file.name
+
+            result = subprocess.run(
+                [
+                    "java",
+                    "-jar",
+                    str(self.checkstyle_jar),
+                    "-c",
+                    str(self.config_file),
+                    filename,
                 ],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=15,
+                check=False,
             )
 
-            if not result.stdout.strip():
-                return errors, warnings
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
 
-            try:
-                diagnostics = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                return errors, warnings
-
-            for item in diagnostics:
-                rule_code = item.get("code", "")
-
-                if rule_code == "F401":
+            for line in output.splitlines():
+                text = line.strip()
+                if not text:
                     continue
-                location = item.get("location", {})
-                end_location = item.get("end_location", {})
 
-                row = location.get("row", 1)
-                column = location.get("column", 1)
+                import re
 
-                end_row = end_location.get("row", row)
-                end_column = end_location.get("column", column)
-
-                line = max(0, row - 1)
-                column = max(0, column - 1)
-
-                end_line = max(0, end_row - 1)
-                end_column = max(0, end_column - 1)
-
-                message = item.get(
-                    "message",
-                    "Unbekannter Ruff-Fehler"
+                match = re.search(
+                    r":(\d+):(\d+):\s*(.+)",
+                    text,
                 )
+                if not match:
+                    continue
 
-                rule_code = item.get("code", "")
+                row = max(0, int(match.group(1)) - 1)
+                column = max(0, int(match.group(2)) - 1)
+                message = match.group(3)
 
                 diagnostic = (
-                    line,
+                    row,
                     column,
-                    end_line,
-                    end_column,
-                    f"{rule_code}: {message}",
+                    row,
+                    column + 1,
+                    f"Checkstyle: {message}",
                 )
 
-                if self._is_error(rule_code):
+                if "[ERROR]" in text:
                     errors.append(diagnostic)
                 else:
                     warnings.append(diagnostic)
 
-        except Exception:
-            pass
+            if result.returncode not in (0, 1) and not errors and not warnings:
+                warnings.append(
+                    (0, 0, 0, 0, "Checkstyle konnte die Java-Datei nicht analysieren.")
+                )
 
+        except subprocess.TimeoutExpired:
+            warnings.append((0, 0, 0, 0, "Checkstyle-Analyse hat zu lange gedauert."))
+        except OSError as exc:
+            warnings.append((0, 0, 0, 0, f"Java-Analyse fehlgeschlagen: {exc}"))
         finally:
             if filename:
-                Path(filename).unlink(missing_ok=True)
+                try:
+                    Path(filename).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         return errors, warnings
-
-    def _is_error(self, rule_code):
-        return (
-                rule_code == "invalid-syntax"
-                or rule_code == "F821"
-                or rule_code.startswith("E9")
-        )
 
     def analyze_errors(self, code):
         errors, _ = self.analyze(code)
@@ -109,27 +248,3 @@ class PythonAnalyzer:
     def analyze_warnings(self, code):
         _, warnings = self.analyze(code)
         return warnings
-
-    def get_ruff_command(self):
-        if getattr(sys, "frozen", False):
-            base_path = Path(sys.executable).parent
-            ruff = base_path / "ruff.exe"
-
-            if ruff.exists():
-                return [str(ruff)]
-
-            meipass = getattr(sys, "_MEIPASS", None)
-
-            if meipass:
-                ruff = Path(meipass) / "ruff.exe"
-
-                if ruff.exists():
-                    return [str(ruff)]
-
-            return None
-
-        return [
-            sys.executable,
-            "-m",
-            "ruff",
-        ]

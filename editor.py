@@ -21,7 +21,7 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QTextCursor,
     QTextFormat,
-    QTextOption,
+    QTextOption, QTextDocument,
 )
 
 from PySide6.QtWidgets import (
@@ -31,12 +31,16 @@ from PySide6.QtWidgets import (
     QToolButton,
 )
 
-from analyzer import PythonAnalyzer
+from analyzer import PythonAnalyzer, JavaAnalyzer
 from breadcrumb import Breadcrumb
 from completion_model import CompletionModel
 from completion_popup import CompletionPopup
 from folding import FoldingAnalyzer
-from highlighter import PythonHighlighter
+from highlighter import (
+    PythonHighlighter,
+    LanguageHighlighter
+)
+
 from language_manager import LanguageManager
 from line_number_area import LineNumberArea
 from minimap import Minimap
@@ -55,7 +59,10 @@ class Editor(QPlainTextEdit):
         super().__init__()
 
         self.settings = settings
-        self.lang = LanguageManager(self.settings.language)
+        self.lang = LanguageManager(
+            self.settings.language
+        )
+        self.language_manager = self.lang
 
         self.minimap_width = 80
         self.minimap = Minimap(self)
@@ -98,11 +105,24 @@ class Editor(QPlainTextEdit):
 
         self.highlighter = None
         if self.settings.syntax_highlighting:
-            self.highlighter = PythonHighlighter(self.document())
+            self.highlighter = None
 
         self.line_number_area = LineNumberArea(self)
         self.model = CompletionModel()
-        self.analyzer = PythonAnalyzer()
+        self.python_analyzer = PythonAnalyzer()
+
+        self.java_analyzer = JavaAnalyzer(
+            checkstyle_jar=getattr(
+                self.settings,
+                "checkstyle_jar",
+                None
+            ),
+            config_file=getattr(
+                self.settings,
+                "checkstyle_config",
+                None
+            )
+        )
         self.completion = CompletionPopup()
         self.completion.completed.connect(self.insert_completion)
         self.variable_analyzer = VariableAnalyzer()
@@ -144,7 +164,10 @@ class Editor(QPlainTextEdit):
         self.textChanged.connect(
             lambda: self.string_comment_timer.start(200)
         )
-        self.textChanged.connect(self.run_analysis)
+        self.selectionChanged.connect(self.highlight_matching_words)
+        self.analysis_timer = QTimer(self)
+        self.analysis_timer.setSingleShot(True)
+        self.analysis_timer.timeout.connect(self.run_analysis)
         self.update_string_comment_ranges()
 
         self.update_line_number_area_width()
@@ -319,12 +342,15 @@ class Editor(QPlainTextEdit):
                     else:
                         break
 
-                if line.rstrip().endswith(":"):
+                stripped = line.rstrip()
+
+                if stripped.endswith(":") or stripped.endswith("{") or stripped.endswith("("):
                     indent += " " * self.settings.tab_size
 
             cursor.beginEditBlock()
             cursor.insertText("\n" + indent)
             cursor.endEditBlock()
+
             self.setTextCursor(cursor)
             self.smart_save()
             return
@@ -376,6 +402,19 @@ class Editor(QPlainTextEdit):
 
                 return
 
+        if event.key() == Qt.Key_Backspace:
+            cursor = self.textCursor()
+            line = cursor.block().text()
+
+            if not line.strip() and cursor.positionInBlock() > 0:
+                cursor.beginEditBlock()
+                cursor.select(QTextCursor.LineUnderCursor)
+                cursor.removeSelectedText()
+                cursor.endEditBlock()
+
+                self.setTextCursor(cursor)
+                return
+
         super().keyPressEvent(event)
 
         text = event.text()
@@ -394,6 +433,43 @@ class Editor(QPlainTextEdit):
             self.show_completion()
         else:
             self.completion.hide()
+
+    def highlight_matching_words(self):
+        selections = []
+        cursor = self.textCursor()
+
+        if not cursor.hasSelection():
+            self.setExtraSelections([])
+            return
+
+        word = cursor.selectedText().strip()
+
+        if not word or not word.isidentifier():
+            self.setExtraSelections([])
+            return
+
+        document_cursor = QTextCursor(self.document())
+
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#665c00"))
+        fmt.setForeground(QColor("#ffffff"))
+
+        while True:
+            document_cursor = self.document().find(
+                word,
+                document_cursor,
+                QTextDocument.FindCaseSensitively
+            )
+
+            if document_cursor.isNull():
+                break
+
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = QTextCursor(document_cursor)
+            selection.format = fmt
+            selections.append(selection)
+
+        self.setExtraSelections(selections)
 
     def line_number_area_paint_event(self, event):
         painter = QPainter(self.line_number_area)
@@ -921,9 +997,24 @@ class Editor(QPlainTextEdit):
         )
 
         if self.settings.syntax_highlighting:
-            if self.highlighter is None:
-                self.highlighter = PythonHighlighter(self.document())
+
+            if self.current_file:
+                self.update_language(
+                    self.current_file
+                )
+
+            elif self.highlighter is None:
+                self.highlighter = PythonHighlighter(
+                    self.document(),
+                    self.settings
+                )
+
+            else:
+                self.highlighter.update_formats()
+                self.highlighter.rehighlight()
+
         else:
+
             if self.highlighter:
                 self.highlighter.setDocument(None)
                 self.highlighter = None
@@ -1003,29 +1094,44 @@ class Editor(QPlainTextEdit):
     def run_analysis(self):
         text = self.toPlainText()
 
-        try:
-            self.errors, self.warnings = self.analyzer.analyze(text)
+        is_java = (
+                self.current_file is not None
+                and Path(self.current_file).suffix.lower() == ".java"
+        )
 
-        except Exception as e:
+        if is_java:
+            analyzer = self.java_analyzer
+        else:
+            analyzer = self.python_analyzer
+
+        try:
+            self.errors, self.warnings = analyzer.analyze(text)
+        except Exception:
             self.errors = []
             self.warnings = []
 
-        try:
-            self.folding.analyze(text)
-            valid_folds = set(self.folding.folds)
+        if not is_java:
+            try:
+                self.folding.analyze(text)
 
-            self.folded_ranges = {
-                fold
-                for fold in self.folded_ranges
-                if fold in valid_folds
-            }
-        except Exception:
-            pass
+                valid_folds = set(self.folding.folds)
 
-        try:
-            self.breadcrumb.update(self)
-        except Exception:
-            pass
+                self.folded_ranges = {
+                    fold
+                    for fold in self.folded_ranges
+                    if fold in valid_folds
+                }
+            except Exception:
+                pass
+
+            try:
+                self.breadcrumb.update(self)
+            except Exception:
+                pass
+
+        else:
+            self.model.variables.clear()
+            self.sticky_lines = []
 
         self.update_error_marks()
         self.minimap.update()
@@ -1318,21 +1424,61 @@ class Editor(QPlainTextEdit):
         self.completion.show_items(words, self.cursorRect(), self)
 
     def setup_autocomplete(self):
-        words = [
-            "False", "None", "True", "and", "as", "assert", "async",
-            "await", "break", "class", "continue", "def", "del",
-            "elif", "else", "except", "finally", "for", "from",
-            "global", "if", "import", "in", "is", "lambda",
-            "nonlocal", "not", "or", "pass", "raise", "return",
-            "try", "while", "with", "yield", "print", "input",
-            "len", "range", "open", "list", "dict", "tuple",
-            "set", "int", "float", "str", "bool", "enumerate",
-            "zip", "map", "filter", "sorted", "sum", "min",
-            "max", "abs", "QWidget", "QMainWindow", "QDialog",
-            "QPushButton", "QLabel", "QLineEdit", "QVBoxLayout",
-            "QHBoxLayout", "QGridLayout", "QTimer", "Signal",
-            "self", "__init__"
-        ]
+        suffix = (
+            Path(self.current_file).suffix.lower()
+            if self.current_file
+            else ".py"
+        )
+
+        if suffix == ".java":
+            words = [
+                "abstract", "assert", "boolean", "break",
+                "byte", "case", "catch", "char", "class",
+                "const", "continue", "default", "do",
+                "double", "else", "enum", "extends",
+                "final", "finally", "float", "for",
+                "if", "implements", "import", "instanceof",
+                "int", "interface", "long", "native",
+                "new", "package", "private", "protected",
+                "public", "return", "short", "static",
+                "strictfp", "super", "switch", "synchronized",
+                "this", "throw", "throws", "transient",
+                "try", "void", "volatile", "while",
+
+                "String", "System", "Object", "Integer",
+                "Double", "Boolean", "Character",
+                "Math", "Scanner", "ArrayList",
+                "HashMap", "HashSet", "List", "Map",
+                "Set", "Collections",
+
+                "println", "print", "printf",
+                "length", "equals", "toString",
+                "charAt", "substring", "contains",
+                "add", "remove", "size", "get", "set",
+
+                "sout", "psvm"
+            ]
+
+        elif suffix == ".py":
+            words = [
+                "False", "None", "True", "and", "as",
+                "assert", "async", "await", "break",
+                "class", "continue", "def", "del",
+                "elif", "else", "except", "finally",
+                "for", "from", "global", "if", "import",
+                "in", "is", "lambda", "nonlocal", "not",
+                "or", "pass", "raise", "return", "try",
+                "while", "with", "yield", "print", "input",
+                "len", "range", "open", "list", "dict",
+                "tuple", "set", "int", "float", "str",
+                "bool", "enumerate", "zip", "map",
+                "filter", "sorted", "sum", "min", "max",
+                "abs", "QWidget", "QMainWindow", "QDialog",
+                "QPushButton", "QLabel", "QLineEdit",
+                "QVBoxLayout", "QHBoxLayout",
+                "QGridLayout", "QTimer", "Signal",
+                "self", "__init__"
+            ]
 
         self.model.add_words(words)
 
@@ -1371,6 +1517,7 @@ class Editor(QPlainTextEdit):
 
     def load_file(self, path):
         path = Path(path)
+
         if not path.is_file():
             return
 
@@ -1380,13 +1527,19 @@ class Editor(QPlainTextEdit):
         self.setPlainText(text)
         self.blockSignals(False)
 
+        self.current_file = str(path)
+
+        self.update_language(self.current_file)
         self.run_analysis()
 
-        self.current_file = str(path)
         self.modified = False
         self.modified_changed.emit(False)
 
-        words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text)
+        words = re.findall(
+            r"[A-Za-z_][A-Za-z0-9_]*",
+            text
+        )
+
         self.model.words.clear()
         self.setup_autocomplete()
         self.model.add_words(words)
@@ -1462,3 +1615,33 @@ class Editor(QPlainTextEdit):
 
         painter = QPainter(self.viewport())
         self.paint_sticky_lines(painter)
+
+    def update_language(self, file_path=None):
+
+        suffix = (
+            Path(file_path).suffix.lower()
+            if file_path
+            else ".py"
+        )
+
+        language = self.language_manager.get_programming_language(suffix)
+
+        if self.highlighter is not None:
+            self.highlighter.setDocument(None)
+            self.highlighter = None
+
+        if suffix == ".py":
+            self.highlighter = PythonHighlighter(
+                self.document(),
+                self.settings
+            )
+
+        elif language is not None:
+            self.highlighter = LanguageHighlighter(
+                self.document(),
+                self.settings,
+                language
+            )
+
+        if self.highlighter is not None:
+            self.highlighter.rehighlight()
