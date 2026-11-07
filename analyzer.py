@@ -1,10 +1,9 @@
 import json
-import shutil
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-
 
 class PythonAnalyzer:
     def analyze(self, code):
@@ -136,30 +135,149 @@ class PythonAnalyzer:
 class JavaAnalyzer:
 
     def __init__(self, checkstyle_jar=None, config_file=None):
-        self.checkstyle_jar = Path(checkstyle_jar) if checkstyle_jar else None
-        self.config_file = Path(config_file) if config_file else None
+        self.checkstyle_jar = (
+            Path(checkstyle_jar) if checkstyle_jar else None
+        )
+        self.config_file = (
+            Path(config_file) if config_file else None
+        )
 
     def analyze(self, code):
+        errors = []
+        warnings = []
+
+        java_errors, java_warnings = self._analyze_javac(code)
+
+        errors.extend(java_errors)
+        warnings.extend(java_warnings)
+
+        checkstyle_errors, checkstyle_warnings = (
+            self._analyze_checkstyle(code)
+        )
+
+        errors.extend(checkstyle_errors)
+        warnings.extend(checkstyle_warnings)
+
+        return errors, warnings
+
+    def _analyze_javac(self, code):
+        errors = []
+        warnings = []
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_dir = Path(temp_dir)
+
+                # Namen der öffentlichen Klasse ermitteln
+                match = re.search(
+                    r"\bpublic\s+(?:(?:abstract|final|sealed|"
+                    r"non-sealed|strictfp)\s+)*"
+                    r"(?:class|interface|enum|record)\s+"
+                    r"([A-Za-z_$][\w$]*)",
+                    code
+                )
+
+                class_name = match.group(1) if match else "Main"
+
+                filename = temp_dir / f"{class_name}.java"
+
+                filename.write_text(
+                    code,
+                    encoding="utf-8"
+                )
+
+                result = subprocess.run(
+                    [
+                        "javac",
+                        "-XDrawDiagnostics",
+                        "-proc:none",
+                        "-d",
+                        str(temp_dir),
+                        str(filename)
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=15,
+                    check=False
+                )
+
+                output = (
+                        (result.stdout or "")
+                        + "\n"
+                        + (result.stderr or "")
+                )
+
+                for line in output.splitlines():
+
+                    match = re.search(
+                        r"\.java:(\d+)(?::(\d+))?:\s*(.+)",
+                        line
+                    )
+
+                    if not match:
+                        continue
+
+                    row = max(0, int(match.group(1)) - 1)
+
+                    if match.group(2):
+                        column = max(0, int(match.group(2)) - 1)
+                    else:
+                        column = 0
+
+                    message = match.group(3)
+
+                    diagnostic = (
+                        row,
+                        column,
+                        row,
+                        column + 1,
+                        f"javac: {message}"
+                    )
+
+                    if ".warn." in message or message.startswith("compiler.warn"):
+                        warnings.append(diagnostic)
+                    else:
+                        errors.append(diagnostic)
+
+        except subprocess.TimeoutExpired:
+            warnings.append((
+                0, 0, 0, 0,
+                "Java-Compiler hat zu lange gebraucht."
+            ))
+
+        except FileNotFoundError:
+            warnings.append((
+                0, 0, 0, 0,
+                "javac wurde nicht gefunden. Ist das JDK installiert?"
+            ))
+
+        except OSError as exc:
+            warnings.append((
+                0, 0, 0, 0,
+                f"Java-Compiler konnte nicht gestartet werden: {exc}"
+            ))
+
+        return errors, warnings
+
+    def _analyze_checkstyle(self, code):
         errors = []
         warnings = []
         filename = None
 
         if not self.checkstyle_jar or not self.checkstyle_jar.is_file():
-            warnings.append(
-                (
-                    0, 0, 0, 0,
-                    "Java-Analyse nicht eingerichtet: Checkstyle-JAR fehlt.",
-                )
-            )
+            warnings.append((
+                0, 0, 0, 0,
+                "Checkstyle-JAR fehlt."
+            ))
             return errors, warnings
 
         if not self.config_file or not self.config_file.is_file():
-            warnings.append(
-                (
-                    0, 0, 0, 0,
-                    "Java-Analyse nicht eingerichtet: Checkstyle-Konfiguration fehlt.",
-                )
-            )
+            warnings.append((
+                0, 0, 0, 0,
+                "Checkstyle-Konfiguration fehlt."
+            ))
             return errors, warnings
 
         try:
@@ -168,7 +286,7 @@ class JavaAnalyzer:
                     delete=False,
                     mode="w",
                     encoding="utf-8",
-                    newline="\n",
+                    newline="\n"
             ) as file:
                 file.write(code)
                 filename = file.name
@@ -180,58 +298,85 @@ class JavaAnalyzer:
                     str(self.checkstyle_jar),
                     "-c",
                     str(self.config_file),
-                    filename,
+                    filename
                 ],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=15,
-                check=False,
+                check=False
             )
 
-            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            output = (
+                    (result.stdout or "")
+                    + "\n"
+                    + (result.stderr or "")
+            )
+
+            source_lines = code.splitlines()
 
             for line in output.splitlines():
                 text = line.strip()
-                if not text:
+
+                if not text.startswith("[ERROR]") and not text.startswith("[WARN]"):
                     continue
 
-                import re
-
                 match = re.search(
-                    r":(\d+):(\d+):\s*(.+)",
-                    text,
+                    r"\[(ERROR|WARN)\]\s+.+?:(\d+)(?::(\d+))?:\s*(.+)",
+                    text
                 )
+
                 if not match:
                     continue
 
-                row = max(0, int(match.group(1)) - 1)
-                column = max(0, int(match.group(2)) - 1)
-                message = match.group(3)
+                severity = match.group(1)
+                row = max(0, int(match.group(2)) - 1)
+
+                if match.group(3):
+                    column = max(0, int(match.group(3)) - 1)
+                else:
+                    column = 0
+
+                message = match.group(4)
+
+                if "LineLength" in message and row < len(source_lines):
+                    column = max(
+                        0,
+                        min(120, len(source_lines[row]) - 1)
+                    )
 
                 diagnostic = (
                     row,
                     column,
                     row,
                     column + 1,
-                    f"Checkstyle: {message}",
+                    f"Checkstyle: {message}"
                 )
 
-                if "[ERROR]" in text:
+                if severity == "ERROR":
                     errors.append(diagnostic)
                 else:
                     warnings.append(diagnostic)
 
             if result.returncode not in (0, 1) and not errors and not warnings:
-                warnings.append(
-                    (0, 0, 0, 0, "Checkstyle konnte die Java-Datei nicht analysieren.")
-                )
+                warnings.append((
+                    0, 0, 0, 0,
+                    "Checkstyle konnte die Java-Datei nicht analysieren."
+                ))
 
         except subprocess.TimeoutExpired:
-            warnings.append((0, 0, 0, 0, "Checkstyle-Analyse hat zu lange gedauert."))
+            warnings.append((
+                0, 0, 0, 0,
+                "Checkstyle-Analyse hat zu lange gedauert."
+            ))
+
         except OSError as exc:
-            warnings.append((0, 0, 0, 0, f"Java-Analyse fehlgeschlagen: {exc}"))
+            warnings.append((
+                0, 0, 0, 0,
+                f"Checkstyle konnte nicht gestartet werden: {exc}"
+            ))
+
         finally:
             if filename:
                 try:

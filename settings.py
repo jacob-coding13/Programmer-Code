@@ -90,6 +90,12 @@ class Settings:
             "developer_mode": False,
             "logging": False,
         },
+        "java": {
+            "checkstyle_jar": "",
+            "checkstyle_config": "",
+            "analysis_enabled": True,
+            "warnings_enabled": True,
+        },
     }
 
     _COMPATIBILITY = {

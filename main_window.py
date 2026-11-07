@@ -211,7 +211,14 @@ class MainWindow(QMainWindow):
     def open_file(self, path):
         self.editor_tabs.open_file(path)
         self.outline.load_file(path)
+
         editor = self.editor_tabs.current_editor()
+
+        if editor:
+            editor.errors = []
+            editor.warnings = []
+            editor.update_error_marks()
+            editor.run_analysis()
 
     def open_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, self.lang.get("open_file"))

@@ -94,14 +94,15 @@ class Terminal(QPlainTextEdit):
 
         path = Path(file).resolve()
 
-        if not path.is_file:
+        if not path.is_file():
             return
 
         suffix = path.suffix.lower()
 
         if suffix not in (".py", ".java"):
             self.write(
-                error = True
+                "Unsupported file type.\n",
+                error=True
             )
             return
 
@@ -211,11 +212,13 @@ class Terminal(QPlainTextEdit):
         if not self.user_has_input:
             self.input_start = self.document().characterCount() - 1
 
-    def process_finished(self, exit_code = 0, exit_status = None):
+    def process_finished(self, exit_code=0, exit_status=None):
         if getattr(self, "java_mode", None) == "compile":
             if exit_code != 0:
                 self.java_mode = None
+
                 self.write(
+                    "\n> Java compilation failed.\n",
                     error=True
                 )
 
@@ -229,6 +232,7 @@ class Terminal(QPlainTextEdit):
         self.user_has_input = False
 
         msg = self.lang.get("process_finished")
+
         self.setReadOnly(True)
         self.write(f"\n> {msg}\n")
 

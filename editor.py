@@ -10,7 +10,10 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
     QPoint,
-    QPointF
+    QPointF,
+    QRunnable,
+    QThreadPool,
+    QObject
 )
 
 from PySide6.QtGui import (
@@ -29,6 +32,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QTextEdit,
     QToolButton,
+    QMenu
 )
 
 from analyzer import PythonAnalyzer, JavaAnalyzer
@@ -40,13 +44,46 @@ from highlighter import (
     PythonHighlighter,
     LanguageHighlighter
 )
-
+from quick_fixes import QuickFixProvider
 from language_manager import LanguageManager
 from line_number_area import LineNumberArea
 from minimap import Minimap
 from theme_manager import get_app_style
 from themes import THEMES
 from variable_analyzer import VariableAnalyzer
+
+
+class AnalysisSignals(QObject):
+    finished = Signal(int, str, str, list, list)
+
+
+class AnalysisWorker(QRunnable):
+
+    def __init__(self, request_id, filename, code, analyzer):
+        super().__init__()
+
+        self.request_id = request_id
+        self.filename = filename
+        self.code = code
+        self.analyzer = analyzer
+
+        self.signals = AnalysisSignals()
+
+    def run(self):
+        try:
+            errors, warnings = self.analyzer.analyze(self.code)
+
+        except Exception as exc:
+            errors = []
+            warnings = [(0, 0, 0, 0, f"Analysefehler: {exc}")]
+
+        self.signals.finished.emit(
+            self.request_id,
+            self.filename,
+            self.code,
+            errors,
+            warnings
+        )
 
 
 class Editor(QPlainTextEdit):
@@ -86,6 +123,7 @@ class Editor(QPlainTextEdit):
         self.errors = []
         self.warnings = []
         self.bracket_selections = []
+        self.word_selections = []
         self.string_comment_ranges = []
 
         self.opening_pairs = {
@@ -111,26 +149,23 @@ class Editor(QPlainTextEdit):
         self.model = CompletionModel()
         self.python_analyzer = PythonAnalyzer()
 
+        base_dir = Path(__file__).resolve().parent
+
         self.java_analyzer = JavaAnalyzer(
-            checkstyle_jar=getattr(
-                self.settings,
-                "checkstyle_jar",
-                None
-            ),
-            config_file=getattr(
-                self.settings,
-                "checkstyle_config",
-                None
-            )
+            checkstyle_jar=base_dir / "tools" / "checkstyle-14.4.0-all.jar",
+            config_file=base_dir / "tools" / "checkstyle.xml"
         )
+
         self.completion = CompletionPopup()
         self.completion.completed.connect(self.insert_completion)
         self.variable_analyzer = VariableAnalyzer()
+        self.quick_fix_provider = QuickFixProvider()
 
         self.setMouseTracking(True)
 
         self.analysis_timer = QTimer(self)
         self.analysis_timer.setSingleShot(True)
+        self.analysis_timer.setInterval(700)
         self.analysis_timer.timeout.connect(self.run_analysis)
 
         self.smart_save_timer = QTimer(self)
@@ -160,20 +195,45 @@ class Editor(QPlainTextEdit):
         )
 
         self.textChanged.connect(self.document_changed)
-        self.textChanged.connect(self.update_variables)
+        self.variables_timer = QTimer(self)
+        self.variables_timer.setSingleShot(True)
+        self.variables_timer.setInterval(400)
+        self.variables_timer.timeout.connect(self.update_variables)
+
+        self.textChanged.connect(
+            lambda: self.variables_timer.start()
+        )
+
+        self.textChanged.connect(
+            lambda: self.comment_timer.start()
+        )
+
         self.textChanged.connect(
             lambda: self.string_comment_timer.start(200)
         )
-        self.selectionChanged.connect(self.highlight_matching_words)
-        self.analysis_timer = QTimer(self)
-        self.analysis_timer.setSingleShot(True)
-        self.analysis_timer.timeout.connect(self.run_analysis)
+
         self.update_string_comment_ranges()
 
         self.update_line_number_area_width()
         self.setup_autocomplete()
         self.apply_settings()
         self.position_run_button()
+
+        self.analysis_pool = QThreadPool.globalInstance()
+        self.analysis_request_id = 0
+        self.analysis_workers = {}
+
+        self.variables_timer = QTimer(self)
+        self.variables_timer.setSingleShot(True)
+        self.variables_timer.setInterval(400)
+        self.variables_timer.timeout.connect(self.update_variables)
+
+        self.comment_timer = QTimer(self)
+        self.comment_timer.setSingleShot(True)
+        self.comment_timer.setInterval(200)
+        self.comment_timer.timeout.connect(self.update_comment_ranges)
+
+        self.comment_ranges = []
 
         self.callable_words = {
             "print",
@@ -257,50 +317,59 @@ class Editor(QPlainTextEdit):
             "breakpoint",
         }
 
-    def is_in_comment(self, position):
-        try:
-            tokens = tokenize.generate_tokens(
-                io.StringIO(self.toPlainText()).readline
+    def show_quick_fixes(self):
+        code = self.toPlainText()
+
+        filename = (
+            str(self.current_file)
+            if self.current_file is not None
+            else ""
+        )
+
+        language = (
+            "java"
+            if filename.lower().endswith(".java")
+            else "python"
+        )
+
+        fixes = self.quick_fix_provider.get_fixes(
+            code,
+            language,
+            self.errors,
+            self.warnings
+        )
+
+        if not fixes:
+            return
+
+        menu = QMenu(self)
+
+        for fix in fixes:
+            action = menu.addAction(fix.title)
+            action.triggered.connect(
+                lambda checked=False, current_fix=fix:
+                current_fix.apply(self)
             )
 
-            for token in tokens:
-                if token.type != tokenize.COMMENT:
-                    continue
+        menu.exec(
+            self.mapToGlobal(self.cursorRect().bottomRight())
+        )
 
-                start_line, start_column = token.start
-                end_line, end_column = token.end
-
-                start_block = self.document().findBlockByNumber(
-                    start_line - 1
-                )
-                end_block = self.document().findBlockByNumber(
-                    end_line - 1
-                )
-
-                if not start_block.isValid() or not end_block.isValid():
-                    continue
-
-                start_position = (
-                        start_block.position() + start_column
-                )
-
-                end_position = (
-                        end_block.position() + end_column
-                )
-
-                if start_position <= position < end_position:
-                    return True
-
-        except (
-                tokenize.TokenError,
-                IndentationError,
-                SyntaxError,
-        ):
-            pass
-
-        return False
+    def is_in_comment(self, position):
+        return any(
+            start <= position < end
+            for start, end in self.comment_ranges
+        )
 
     def keyPressEvent(self, event: QKeyEvent):
+
+        if (
+                event.key() == Qt.Key_Return
+                and event.modifiers() == Qt.AltModifier
+        ):
+            self.show_quick_fixes()
+            return
+
         if event.modifiers() & Qt.ControlModifier:
             if event.key() == Qt.Key_Z:
                 self.undo()
@@ -406,10 +475,15 @@ class Editor(QPlainTextEdit):
             cursor = self.textCursor()
             line = cursor.block().text()
 
-            if not line.strip() and cursor.positionInBlock() > 0:
+            if not line.strip() and cursor.blockNumber() > 0:
                 cursor.beginEditBlock()
-                cursor.select(QTextCursor.LineUnderCursor)
-                cursor.removeSelectedText()
+
+                cursor.movePosition(QTextCursor.StartOfBlock)
+                cursor.movePosition(QTextCursor.PreviousBlock)
+                cursor.movePosition(QTextCursor.EndOfBlock)
+
+                cursor.deleteChar()
+
                 cursor.endEditBlock()
 
                 self.setTextCursor(cursor)
@@ -435,17 +509,18 @@ class Editor(QPlainTextEdit):
             self.completion.hide()
 
     def highlight_matching_words(self):
-        selections = []
+        self.word_selections = []
+
         cursor = self.textCursor()
 
         if not cursor.hasSelection():
-            self.setExtraSelections([])
+            self.update_error_marks()
             return
 
         word = cursor.selectedText().strip()
 
         if not word or not word.isidentifier():
-            self.setExtraSelections([])
+            self.update_error_marks()
             return
 
         document_cursor = QTextCursor(self.document())
@@ -467,9 +542,10 @@ class Editor(QPlainTextEdit):
             selection = QTextEdit.ExtraSelection()
             selection.cursor = QTextCursor(document_cursor)
             selection.format = fmt
-            selections.append(selection)
 
-        self.setExtraSelections(selections)
+            self.word_selections.append(selection)
+
+        self.update_error_marks()
 
     def line_number_area_paint_event(self, event):
         painter = QPainter(self.line_number_area)
@@ -1091,28 +1167,39 @@ class Editor(QPlainTextEdit):
             """
         )
 
-    def run_analysis(self):
-        text = self.toPlainText()
+    def _analysis_finished(
+            self,
+            request_id,
+            filename,
+            code,
+            errors,
+            warnings
+    ):
+        self.analysis_workers.pop(request_id, None)
 
-        is_java = (
-                self.current_file is not None
-                and Path(self.current_file).suffix.lower() == ".java"
+        if request_id != self.analysis_request_id:
+            return
+
+        current_filename = (
+            str(self.current_file)
+            if self.current_file is not None
+            else ""
         )
 
-        if is_java:
-            analyzer = self.java_analyzer
-        else:
-            analyzer = self.python_analyzer
+        if filename != current_filename:
+            return
 
-        try:
-            self.errors, self.warnings = analyzer.analyze(text)
-        except Exception:
-            self.errors = []
-            self.warnings = []
+        if code != self.toPlainText():
+            return
+
+        self.errors = errors
+        self.warnings = warnings
+
+        is_java = filename.lower().endswith(".java")
 
         if not is_java:
             try:
-                self.folding.analyze(text)
+                self.folding.analyze(code)
 
                 valid_folds = set(self.folding.folds)
 
@@ -1121,6 +1208,7 @@ class Editor(QPlainTextEdit):
                     for fold in self.folded_ranges
                     if fold in valid_folds
                 }
+
             except Exception:
                 pass
 
@@ -1135,6 +1223,39 @@ class Editor(QPlainTextEdit):
 
         self.update_error_marks()
         self.minimap.update()
+
+    def run_analysis(self):
+        text = self.toPlainText()
+
+        filename = (
+            str(self.current_file)
+            if self.current_file is not None
+            else ""
+        )
+
+        is_java = filename.lower().endswith(".java")
+
+        analyzer = (
+            self.java_analyzer
+            if is_java
+            else self.python_analyzer
+        )
+
+        self.analysis_request_id += 1
+        request_id = self.analysis_request_id
+
+        worker = AnalysisWorker(
+            request_id,
+            filename,
+            text,
+            analyzer
+        )
+
+        worker.signals.finished.connect(self._analysis_finished)
+
+        self.analysis_workers[request_id] = worker
+
+        self.analysis_pool.start(worker)
 
     def update_line_number_area_width(self):
         minimap_width = self.minimap_width if self.settings.minimap else 0
@@ -1172,11 +1293,6 @@ class Editor(QPlainTextEdit):
         if self.settings.smart_save:
             self.smart_save_timer.start()
 
-        try:
-            self.folding.analyze(self.toPlainText())
-        except Exception:
-            pass
-
     def smart_save(self):
         if not self.settings.smart_save:
             return
@@ -1201,6 +1317,53 @@ class Editor(QPlainTextEdit):
                     if isinstance(target, ast.Name):
                         self.model.add_variable(target.id)
 
+    def update_comment_ranges(self):
+        self.comment_ranges = []
+
+        code = self.toPlainText()
+
+        try:
+            tokens = tokenize.generate_tokens(
+                io.StringIO(code).readline
+            )
+
+            for token in tokens:
+                if token.type != tokenize.COMMENT:
+                    continue
+
+                start_line, start_column = token.start
+                end_line, end_column = token.end
+
+                start_block = self.document().findBlockByNumber(
+                    start_line - 1
+                )
+
+                end_block = self.document().findBlockByNumber(
+                    end_line - 1
+                )
+
+                if not start_block.isValid() or not end_block.isValid():
+                    continue
+
+                start_position = (
+                        start_block.position() + start_column
+                )
+
+                end_position = (
+                        end_block.position() + end_column
+                )
+
+                self.comment_ranges.append(
+                    (start_position, end_position)
+                )
+
+        except (
+                tokenize.TokenError,
+                IndentationError,
+                SyntaxError
+        ):
+            pass
+
     def line_number_area_width(self):
         digits = len(str(max(1, self.blockCount())))
         return 12 + self.fontMetrics().horizontalAdvance("9") * digits
@@ -1208,105 +1371,101 @@ class Editor(QPlainTextEdit):
     def update_error_marks(self):
         selections = []
 
-        for line, column, end_line, end_column, message in self.errors:
-            block = self.document().findBlockByNumber(line)
-
-            if not block.isValid():
-                continue
-
-            cursor = QTextCursor(block)
-
-            start = block.position() + column
-
-            if end_line == line:
-                end = block.position() + end_column
-            else:
-                end_block = self.document().findBlockByNumber(end_line)
-
-                if end_block.isValid():
-                    end = end_block.position() + end_column
-                else:
-                    end = start + 1
-
-            cursor.setPosition(start)
-            cursor.setPosition(
-                max(start + 1, end),
-                QTextCursor.KeepAnchor
-            )
-
-            selection = QTextEdit.ExtraSelection()
-            selection.cursor = cursor
-
-            fmt = QTextCharFormat()
-            fmt.setUnderlineStyle(
-                QTextCharFormat.SpellCheckUnderline
-            )
-            fmt.setUnderlineColor(
-                QColor("#ff3333")
-            )
-
-            selection.format = fmt
-            selections.append(selection)
-
-        for line, column, end_line, end_column, message in self.warnings:
-            block = self.document().findBlockByNumber(line)
-
-            if not block.isValid():
-                continue
-
-            cursor = QTextCursor(block)
-
-            start = block.position() + column
-
-            if end_line == line:
-                end = block.position() + end_column
-            else:
-                end_block = self.document().findBlockByNumber(end_line)
-
-                if end_block.isValid():
-                    end = end_block.position() + end_column
-                else:
-                    end = start + 1
-
-            cursor.setPosition(start)
-            cursor.setPosition(
-                max(start + 1, end),
-                QTextCursor.KeepAnchor
-            )
-
-            selection = QTextEdit.ExtraSelection()
-            selection.cursor = cursor
-
-            fmt = QTextCharFormat()
-            fmt.setUnderlineStyle(
-                QTextCharFormat.SpellCheckUnderline
-            )
-            fmt.setUnderlineColor(
-                QColor("#ffcc00")
-            )
-
-            selection.format = fmt
-            selections.append(selection)
-
         if self.settings.highlight_current_line:
             theme = THEMES[self.settings.theme]
 
             current = QTextEdit.ExtraSelection()
-            current.format.setBackground(
-                QColor(theme["current_line"])
-            )
+            current.format.setBackground(QColor(theme["current_line"]))
             current.format.setProperty(
                 QTextFormat.FullWidthSelection,
                 True
             )
+
             current.cursor = self.textCursor()
             current.cursor.clearSelection()
 
             selections.append(current)
 
+        def add_marks(diagnostics, color):
+            for line, column, end_line, end_column, message in diagnostics:
+
+                if line == 0 and column == 0 and end_line == 0 and end_column == 0:
+                    continue
+
+                block = self.document().findBlockByNumber(line)
+
+                if not block.isValid():
+                    continue
+
+                block_end = block.position() + block.length() - 1
+                start = min(block.position() + column, block_end)
+
+                end_block = self.document().findBlockByNumber(end_line)
+
+                if not end_block.isValid():
+                    continue
+
+                end_block_end = end_block.position() + end_block.length() - 1
+                end = min(end_block.position() + end_column, end_block_end)
+
+                if end <= start:
+                    end = min(start + 1, block_end)
+
+                if end <= start:
+                    continue
+
+                cursor = QTextCursor(self.document())
+                cursor.setPosition(start)
+                cursor.setPosition(end, QTextCursor.KeepAnchor)
+
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = cursor
+
+                fmt = QTextCharFormat()
+                fmt.setUnderlineStyle(QTextCharFormat.WaveUnderline)
+                fmt.setUnderlineColor(QColor(color))
+
+                selection.format = fmt
+                selections.append(selection)
+
+        add_marks(self.errors, "#ff3333")
+
+        add_marks(self.warnings, "#ffcc00")
+
+        selections.extend(self.word_selections)
         selections.extend(self.bracket_selections)
 
         self.setExtraSelections(selections)
+
+    def mouseMoveEvent(self, event):
+        cursor = self.cursorForPosition(event.pos())
+
+        position = cursor.position()
+        block = cursor.block()
+
+        if not block.isValid():
+            return
+
+        line = block.blockNumber()
+        column = position - block.position()
+
+        for diagnostics in (self.errors, self.warnings):
+            for start_line, start_column, end_line, end_column, message in diagnostics:
+
+                if start_line == 0 and start_column == 0 and end_line == 0 and end_column == 0:
+                    continue
+
+                if start_line == end_line == line:
+                    if start_column <= column <= end_column:
+                        self.setToolTip(message)
+                        return
+
+        self.setToolTip("")
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self.setToolTip("")
+        super().leaveEvent(event)
 
     def get_completion_context(self):
         cursor = self.textCursor()
@@ -1456,7 +1615,7 @@ class Editor(QPlainTextEdit):
                 "charAt", "substring", "contains",
                 "add", "remove", "size", "get", "set",
 
-                "sout", "psvm"
+                "sout", "psvm", "serr"
             ]
 
         elif suffix == ".py":
@@ -1489,17 +1648,42 @@ class Editor(QPlainTextEdit):
         for _ in range(len(prefix)):
             cursor.deletePreviousChar()
 
-        cursor.insertText(word)
+        is_java = (
+                self.current_file
+                and self.current_file.endswith(".java")
+        )
 
-        if (
-                getattr(self.settings, "autocomplete_parentheses", True)
-                and word in self.callable_words
-        ):
-            cursor.insertText("()")
-            cursor.movePosition(
-                QTextCursor.Left,
-                QTextCursor.MoveAnchor
+        if is_java and word in ("sout", "serr"):
+            if word == "sout":
+                output = "System.out.println();"
+            elif word == "serr":
+                output = "System.err.println();"
+
+            cursor.insertText(output)
+            cursor.movePosition(QTextCursor.Left, QTextCursor.MoveAnchor)
+            cursor.movePosition(QTextCursor.Left, QTextCursor.MoveAnchor)
+
+        elif is_java and word == "psvm":
+            indent = " " * self.settings.tab_size
+
+            cursor.insertText(
+                "public static void main(String[] args) {\n"
+                + indent
+                + "\n}"
             )
+
+            cursor.movePosition(QTextCursor.Up)
+            cursor.movePosition(QTextCursor.EndOfBlock)
+
+        else:
+            cursor.insertText(word)
+
+            if (
+                    getattr(self.settings, "autocomplete_parentheses", True)
+                    and word in self.callable_words
+            ):
+                cursor.insertText("()")
+                cursor.movePosition(QTextCursor.Left)
 
         self.setTextCursor(cursor)
         self.completion.hide()
