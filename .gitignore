@@ -5,6 +5,7 @@ __pycache__/
 .vscode/
 build/
 dist/
+out/
 *.spec
 settings_*.json
 .programmer_code_folds.json
