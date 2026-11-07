@@ -16,22 +16,26 @@ class CompletionModel:
                 "startswith", "strip", "swapcase", "title",
                 "upper", "zfill",
             ],
+
             "list": [
                 "append", "clear", "copy", "count", "extend",
                 "index", "insert", "pop", "remove", "reverse",
                 "sort",
             ],
+
             "dict": [
                 "clear", "copy", "fromkeys", "get", "items",
                 "keys", "pop", "popitem", "setdefault",
                 "update", "values",
             ],
+
             "set": [
                 "add", "clear", "copy", "difference",
                 "discard", "intersection", "isdisjoint",
                 "issubset", "issuperset", "pop", "remove",
                 "symmetric_difference", "union", "update",
             ],
+
             "tuple": [
                 "count", "index",
             ],
@@ -43,7 +47,8 @@ class CompletionModel:
                 self.words.add(word)
 
     def add_variable(self, name):
-        self.variables.add(name)
+        if isinstance(name, str) and name:
+            self.variables.add(name)
 
     def add_context_words(self, words):
         self.context_words.clear()
@@ -52,32 +57,42 @@ class CompletionModel:
             if isinstance(word, str) and word:
                 self.context_words.add(word)
 
+    def clear_variables(self):
+        self.variables.clear()
+
+    def clear_context_words(self):
+        self.context_words.clear()
+
     def search(self, prefix):
-        prefix = prefix.lower()
+        prefix = str(prefix)
+
+        if not prefix:
+            return []
 
         if self.context_words:
-            results = [
-                word
-                for word in self.context_words
-                if word.lower().startswith(prefix)
-            ]
+            candidates = self.context_words
 
-            results.sort(key=lambda w: (len(w), w.lower()))
-            return results
+        else:
+            candidates = self.words | self.variables
 
-        results = []
+        prefix_lower = prefix.lower()
 
-        for word in self.variables | self.words:
-            if word.lower().startswith(prefix):
-                results.append(word)
+        results = [
+            word
+            for word in candidates
+            if word.lower().startswith(prefix_lower)
+        ]
 
-        results.sort(
-            key=lambda w: (
-                not (w in self.variables),
-                len(w),
-                w.lower()
+        def ranking(word):
+            return (
+                word.lower() != prefix_lower,
+                not word.startswith(prefix),
+                word not in self.variables,
+                len(word),
+                word.lower()
             )
-        )
+
+        results.sort(key=ranking)
 
         return results
 

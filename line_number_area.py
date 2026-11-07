@@ -41,9 +41,8 @@ class LineNumberArea(QWidget):
             height = editor.blockBoundingRect(block).height()
             bottom = top + height
 
-            center_y = top + line_height * 1.75
+            center_y = top + line_height * 0.5
 
-            # Nur prüfen, ob der Klick beim Dreieck liegt
             if abs(y - center_y) <= line_height * 0.5:
 
                 line = block.blockNumber() + 1

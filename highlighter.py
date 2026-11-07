@@ -6,12 +6,7 @@ from PySide6.QtGui import (
     QTextCharFormat
 )
 
-
-def make_format(
-        color,
-        bold=False,
-        italic=False
-):
+def make_format(color, bold=False, italic=False):
 
     fmt = QTextCharFormat()
 
@@ -30,10 +25,7 @@ def make_format(
 
     return fmt
 
-
-class LanguageHighlighter(
-    QSyntaxHighlighter
-):
+class LanguageHighlighter(QSyntaxHighlighter):
 
     def __init__(
             self,
@@ -348,15 +340,9 @@ class LanguageHighlighter(
                     )
                 )
 
-class PythonHighlighter(
-    QSyntaxHighlighter
-):
+class PythonHighlighter(QSyntaxHighlighter):
 
-    def __init__(
-            self,
-            document,
-            settings
-    ):
+    def __init__(self, document, settings):
 
         super().__init__(document)
 
@@ -664,16 +650,11 @@ class PythonHighlighter(
             )
         )
 
-    def highlightBlock(
-            self,
-            text
-    ):
+    def highlightBlock(self, text):
 
         for pattern, fmt in self.rules:
 
-            expression = pattern.globalMatch(
-                text
-            )
+            expression = pattern.globalMatch(text)
 
             while expression.hasNext():
 
@@ -688,37 +669,30 @@ class PythonHighlighter(
         self.match_multiline(
             text,
             self.tri_double,
-            self.string
+            self.string,
+            1
         )
 
         self.match_multiline(
             text,
             self.tri_single,
-            self.string
+            self.string,
+            2
         )
 
-        self.highlight_brackets(
-            text
-        )
+        self.highlight_brackets(text)
 
-    def match_multiline(
-            self,
-            text,
-            delimiter,
-            style
-    ):
+    def match_multiline(self, text, delimiter, style, state):
 
         previous_state = self.previousBlockState()
 
-        if previous_state == 1:
+        if previous_state == state:
 
             start = 0
 
         else:
 
-            match = delimiter.match(
-                text
-            )
+            match = delimiter.match(text)
 
             if not match.hasMatch():
                 return
@@ -742,10 +716,19 @@ class PythonHighlighter(
                     style
                 )
 
-                start = delimiter.match(
+                next_match = delimiter.match(
                     text,
                     end
-                ).capturedStart()
+                )
+
+                start = (
+                    next_match.capturedStart()
+                    if next_match.hasMatch()
+                    else -1
+                )
+
+                if start == -1:
+                    self.setCurrentBlockState(0)
 
             else:
 
@@ -755,72 +738,60 @@ class PythonHighlighter(
                     style
                 )
 
-                self.setCurrentBlockState(
-                    1
-                )
+                self.setCurrentBlockState(state)
 
                 return
 
-        self.setCurrentBlockState(
-            0
-        )
-
-    def highlight_brackets(
-            self,
-            text
-    ):
+    def highlight_brackets(self, text):
 
         depth = 0
 
-        opening = {
-            "(",
-            "[",
-            "{"
-        }
+        opening = {"(", "[", "{"}
+        closing = {")", "]", "}"}
 
-        closing = {
-            ")",
-            "]",
-            "}"
-        }
+        ignored = set()
+
+        for index in range(len(text)):
+
+            fmt = self.format(index)
+
+            foreground = fmt.foreground().color()
+
+            string_color = self.string.foreground().color()
+            comment_color = self.comment.foreground().color()
+
+            if foreground == string_color or foreground == comment_color:
+                ignored.add(index)
 
         for index, char in enumerate(text):
+
+            if index in ignored:
+                continue
 
             if char in opening:
 
                 color = self.brackets[
-                    depth % len(
-                        self.brackets
-                    )
+                    depth % len(self.brackets)
                     ]
 
                 self.setFormat(
                     index,
                     1,
-                    make_format(
-                        color.name()
-                    )
+                    make_format(color.name())
                 )
 
                 depth += 1
 
             elif char in closing:
 
-                depth = max(
-                    0,
-                    depth - 1
-                )
+                depth = max(0, depth - 1)
 
                 color = self.brackets[
-                    depth % len(
-                        self.brackets
-                    )
+                    depth % len(self.brackets)
                     ]
 
                 self.setFormat(
                     index,
                     1,
-                    make_format(
-                        color.name()
-                    )
+                    make_format(color.name())
                 )

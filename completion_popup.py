@@ -9,7 +9,6 @@ class CompletionPopup(QListWidget):
         super().__init__()
 
         self.setWindowFlags(Qt.ToolTip)
-
         self.setFocusPolicy(Qt.NoFocus)
 
         self.setHorizontalScrollBarPolicy(
@@ -22,6 +21,8 @@ class CompletionPopup(QListWidget):
 
         self.setMaximumHeight(250)
         self.setMinimumWidth(260)
+
+        self.setUniformItemSizes(True)
 
         self.itemClicked.connect(
             self.on_item_clicked
@@ -54,12 +55,19 @@ class CompletionPopup(QListWidget):
             self.hide()
             return
 
-        current = [
+        selected_item = self.currentItem()
+
+        selected_text = (
+            selected_item.text()
+            if selected_item else None
+        )
+
+        current_items = [
             self.item(i).text()
             for i in range(self.count())
         ]
 
-        if current != items:
+        if current_items != items:
 
             self.setUpdatesEnabled(False)
 
@@ -70,7 +78,17 @@ class CompletionPopup(QListWidget):
 
             self.setUpdatesEnabled(True)
 
-        self.setCurrentRow(0)
+        restored = False
+
+        if selected_text:
+            for i in range(self.count()):
+                if self.item(i).text() == selected_text:
+                    self.setCurrentRow(i)
+                    restored = True
+                    break
+
+        if not restored:
+            self.setCurrentRow(0)
 
         pos = editor.mapToGlobal(
             rect.bottomLeft()
@@ -115,9 +133,11 @@ class CompletionPopup(QListWidget):
         if item is None:
             return None
 
+        word = item.text()
+
         self.hide()
 
-        return item.text()
+        return word
 
     def current_word(self):
 
@@ -131,4 +151,5 @@ class CompletionPopup(QListWidget):
     def on_item_clicked(self, item):
 
         self.completed.emit(item.text())
+
         self.hide()

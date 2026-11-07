@@ -104,10 +104,12 @@ class PythonAnalyzer:
 
     def _is_error(self, diagnostic):
         code_id = diagnostic.get("code") or ""
+
         return (
                 diagnostic.get("severity") == "error"
                 or code_id == "invalid-syntax"
                 or code_id == "F821"
+                or code_id == "E999"
                 or code_id.startswith("E9")
         )
 
@@ -130,7 +132,6 @@ class PythonAnalyzer:
                 return [str(candidate)]
 
         return None
-
 
 class JavaAnalyzer:
 
@@ -168,7 +169,6 @@ class JavaAnalyzer:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_dir = Path(temp_dir)
 
-                # Namen der öffentlichen Klasse ermitteln
                 match = re.search(
                     r"\bpublic\s+(?:(?:abstract|final|sealed|"
                     r"non-sealed|strictfp)\s+)*"

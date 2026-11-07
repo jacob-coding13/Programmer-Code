@@ -111,6 +111,22 @@ class MainWindow(QMainWindow):
         self.editor_tabs.currentChanged.connect(self.current_tab_changed)
         self.editor_tabs.run_requested.connect(self.run_current_file)
 
+        self.terminal.process.started.connect(
+            self.enable_stop_button
+        )
+
+        self.terminal.finished.connect(
+            self.disable_stop_button
+        )
+
+    def enable_stop_button(self):
+        if hasattr(self, "stop_action"):
+            self.stop_action.setEnabled(True)
+
+    def disable_stop_button(self):
+        if hasattr(self, "stop_action"):
+            self.stop_action.setEnabled(False)
+
     def setup_layout(self):
         left = QSplitter(Qt.Vertical)
         left.addWidget(self.explorer)
@@ -199,7 +215,19 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         run_str = self.lang.get("run")
-        toolbar.addAction(f"▶ {run_str}", self.run_current_file)
+
+        self.run_action = toolbar.addAction(
+            f"▶ {run_str}",
+            self.run_current_file
+        )
+
+        self.stop_action = toolbar.addAction(
+            "■ Stopp",
+            self.terminal.stop
+        )
+
+        self.stop_action.setEnabled(False)
+
         toolbar.addSeparator()
 
         settings_str = self.lang.get("settings")

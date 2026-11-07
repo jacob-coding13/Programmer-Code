@@ -32,7 +32,13 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QTextEdit,
     QToolButton,
-    QMenu
+    QMenu,
+    QFrame,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QInputDialog,
+    QMessageBox
 )
 
 from analyzer import PythonAnalyzer, JavaAnalyzer
@@ -51,39 +57,46 @@ from minimap import Minimap
 from theme_manager import get_app_style
 from themes import THEMES
 from variable_analyzer import VariableAnalyzer
+from python_completion import PythonCompletion
 
 
 class AnalysisSignals(QObject):
-    finished = Signal(int, str, str, list, list)
+    
+    finished = Signal(int, str, str, object, object)
 
 
 class AnalysisWorker(QRunnable):
-
-    def __init__(self, request_id, filename, code, analyzer):
+    def __init__(self, request_id, filename, code, analyzer, signals):        
         super().__init__()
 
         self.request_id = request_id
         self.filename = filename
         self.code = code
         self.analyzer = analyzer
-
-        self.signals = AnalysisSignals()
+        self.signals = signals
 
     def run(self):
+        errors = []
+        warnings = []
+
         try:
             errors, warnings = self.analyzer.analyze(self.code)
 
-        except Exception as exc:
-            errors = []
-            warnings = [(0, 0, 0, 0, f"Analysefehler: {exc}")]
+        except Exception as error:
+            errors = [
+                (0, 0, 0, 0, f"Analysefehler: {error}")
+            ]
 
-        self.signals.finished.emit(
-            self.request_id,
-            self.filename,
-            self.code,
-            errors,
-            warnings
-        )
+        try:
+            self.signals.finished.emit(
+                self.request_id,
+                self.filename,
+                self.code,
+                errors,
+                warnings
+            )
+        except RuntimeError:
+            pass
 
 
 class Editor(QPlainTextEdit):
@@ -108,6 +121,8 @@ class Editor(QPlainTextEdit):
         self.folding = FoldingAnalyzer()
         self.breadcrumb = Breadcrumb()
         self.folded_ranges = set()
+
+        self.python_completion = PythonCompletion()
 
         self.current_file = None
         self.modified = False
@@ -159,7 +174,47 @@ class Editor(QPlainTextEdit):
         self.completion = CompletionPopup()
         self.completion.completed.connect(self.insert_completion)
         self.variable_analyzer = VariableAnalyzer()
-        self.quick_fix_provider = QuickFixProvider()
+        self.quick_fix_provider = QuickFixProvider(
+            language_manager=self.language_manager
+        )
+
+        self.quick_fix_popup = QFrame(self, Qt.Popup)
+        self.quick_fix_popup.setObjectName("quickFixPopup")
+
+        self.quick_fix_layout = QVBoxLayout(self.quick_fix_popup)
+        self.quick_fix_layout.setContentsMargins(10, 8, 10, 8)
+        self.quick_fix_layout.setSpacing(5)
+
+        self.quick_fix_label = QLabel()
+        self.quick_fix_layout.addWidget(self.quick_fix_label)
+
+        self.quick_fix_popup.setStyleSheet("""
+            QFrame#quickFixPopup {
+                background-color: #252526;
+                border: 1px solid #555555;
+                border-radius: 6px;
+            }
+        
+            QLabel {
+                color: white;
+                padding: 3px;
+            }
+        
+            QPushButton {
+                color: white;
+                background-color: #333333;
+                border: none;
+                padding: 6px;
+                text-align: left;
+                border-radius: 4px;
+            }
+        
+            QPushButton:hover {
+                background-color: #454545;
+            }
+        """)
+
+        self.current_quick_fix_diagnostic = None
 
         self.setMouseTracking(True)
 
@@ -222,6 +277,7 @@ class Editor(QPlainTextEdit):
         self.analysis_pool = QThreadPool.globalInstance()
         self.analysis_request_id = 0
         self.analysis_workers = {}
+        self.analysis_signals = {}
 
         self.variables_timer = QTimer(self)
         self.variables_timer.setSingleShot(True)
@@ -317,6 +373,133 @@ class Editor(QPlainTextEdit):
             "breakpoint",
         }
 
+    def rename_symbol(self):
+        cursor = self.textCursor()
+        old_name = cursor.selectedText().strip() if cursor.hasSelection() else self.current_word()
+        if not old_name or not old_name.isidentifier():
+            QMessageBox.information(
+                self, "Umbenennen", "Markiere zuerst einen gültigen Variablennamen oder Methodennamen."
+            )
+            return
+
+        new_name, accepted = QInputDialog.getText(
+            self, "Symbol umbenennen", f"Neuer Name für '{old_name}':"
+        )
+        if not accepted:
+            return
+        new_name = new_name.strip()
+        if not new_name or not new_name.isidentifier():
+            QMessageBox.warning(self, "Ungültiger Name", "Der neue Name ist kein gültiger Bezeichner.")
+            return
+        if new_name == old_name:
+            return
+
+        code = self.toPlainText()
+        matches = list(re.finditer(rf"(?<!\w){re.escape(old_name)}(?!\w)", code))
+        if not matches:
+            return
+
+        # Rückwärts ersetzen, damit sich die zuvor ermittelten Offsets nicht verschieben.
+        edit = QTextCursor(self.document())
+        edit.beginEditBlock()
+        for match in reversed(matches):
+            edit.setPosition(match.start())
+            edit.setPosition(match.end(), QTextCursor.KeepAnchor)
+            edit.insertText(new_name)
+        edit.endEditBlock()
+        self.setTextCursor(edit)
+        self.setFocus()
+
+    def extract_method(self):
+        if not self.current_file or Path(str(self.current_file)).suffix.lower() != ".py":
+            QMessageBox.information(
+                self, "Methode extrahieren", "Das Extrahieren wird derzeit nur für gespeicherte Python-Dateien unterstützt."
+            )
+            return
+
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            QMessageBox.information(
+                self, "Methode extrahieren", "Markiere zuerst einen oder mehrere vollständige Code-Abschnitte."
+            )
+            return
+
+        start = cursor.selectionStart()
+        end = cursor.selectionEnd()
+        start_cursor = QTextCursor(self.document())
+        start_cursor.setPosition(start)
+        end_cursor = QTextCursor(self.document())
+        end_cursor.setPosition(end)
+        start_block = start_cursor.block()
+        end_block = end_cursor.block()
+
+        if start_cursor.positionInBlock() != 0:
+            QMessageBox.warning(self, "Auswahl unvollständig", "Die Auswahl muss am Anfang einer Zeile beginnen.")
+            return
+        if end_cursor.positionInBlock() not in (0, len(end_block.text())):
+            QMessageBox.warning(self, "Auswahl unvollständig", "Die Auswahl muss am Ende einer Zeile enden.")
+            return
+
+        selected_lines = self.toPlainText()[start:end].splitlines()
+        if not selected_lines:
+            return
+        if any(line.startswith((" ", "\t")) for line in selected_lines if line.strip()):
+            QMessageBox.warning(
+                self, "Verschachtelter Code", "Bitte wähle aktuell nur Code auf oberster Einrückungsebene aus."
+            )
+            return
+
+        method_name, accepted = QInputDialog.getText(
+            self, "Methode extrahieren", "Name der neuen Funktion:", text="extracted_method"
+        )
+        if not accepted:
+            return
+        method_name = method_name.strip()
+        if not method_name.isidentifier():
+            QMessageBox.warning(self, "Ungültiger Name", "Der Funktionsname ist ungültig.")
+            return
+
+        parameters, accepted = QInputDialog.getText(
+            self, "Parameter", "Parameter (kommagetrennt, falls benötigt):"
+        )
+        if not accepted:
+            return
+        params = [part.strip() for part in parameters.split(",") if part.strip()]
+        if any(not name.isidentifier() for name in params) or len(set(params)) != len(params):
+            QMessageBox.warning(self, "Ungültige Parameter", "Bitte gib gültige, eindeutige Parameternamen ein.")
+            return
+
+        body = "\n".join(selected_lines).rstrip()
+        if not body.strip():
+            return
+        indented_body = "\n".join("    " + line if line else "" for line in body.split("\n"))
+        call = f"{method_name}({', '.join(params)})"
+        original = self.toPlainText()
+        replacement = call
+        new_code = original[:start] + replacement + original[end:]
+        if new_code and not new_code.endswith("\n"):
+            new_code += "\n"
+        function_text = f"\n\ndef {method_name}({', '.join(params)}):\n{indented_body}\n"
+        new_code += function_text
+
+        warning = (
+            "Die Auswahl wird in eine neue Funktion auf Modulebene verschoben. "
+            "Prüfe danach insbesondere lokale Variablen und return-Anweisungen.\n\n"
+            "Neue Funktion:\n" + function_text.strip()
+        )
+        answer = QMessageBox.question(
+            self, "Extraktion prüfen", warning,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        self.setPlainText(new_code)
+        new_cursor = self.textCursor()
+        new_cursor.setPosition(start)
+        self.setTextCursor(new_cursor)
+        self.setFocus()
+
     def show_quick_fixes(self):
         code = self.toPlainText()
 
@@ -348,12 +531,80 @@ class Editor(QPlainTextEdit):
             action = menu.addAction(fix.title)
             action.triggered.connect(
                 lambda checked=False, current_fix=fix:
-                current_fix.apply(self)
+                self.apply_quick_fix(current_fix)
             )
 
         menu.exec(
             self.mapToGlobal(self.cursorRect().bottomRight())
         )
+
+    def show_diagnostic_popup(self, diagnostic, global_position):
+        line, column, end_line, end_column, message = diagnostic
+
+        fixes = self.quick_fix_provider.get_fixes(
+            self.toPlainText(),
+            "java" if (
+                    self.current_file
+                    and str(self.current_file).lower().endswith(".java")
+            ) else "python",
+            [diagnostic],
+            []
+        )
+
+        if (
+                self.quick_fix_popup.isVisible()
+                and self.current_quick_fix_diagnostic == diagnostic
+        ):
+            return
+
+        self.current_quick_fix_diagnostic = diagnostic
+
+        while self.quick_fix_layout.count() > 1:
+            item = self.quick_fix_layout.takeAt(1)
+
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        self.quick_fix_label.setText(message)
+
+        for fix in fixes:
+            button = QPushButton(fix.title)
+
+            button.clicked.connect(
+                lambda checked=False, current_fix=fix:
+                self.apply_quick_fix(current_fix)
+            )
+
+            self.quick_fix_layout.addWidget(button)
+
+        self.quick_fix_popup.adjustSize()
+        self.quick_fix_popup.move(global_position + QPoint(12, 16))
+        self.quick_fix_popup.show()
+
+    def apply_quick_fix(self, fix):
+        self.quick_fix_popup.hide()
+        self.current_quick_fix_diagnostic = None
+
+        preview = fix.preview(self.toPlainText())
+        before = preview["before"] or "(nichts)"
+        after = preview["after"] or "(wird entfernt)"
+        details = (
+            f"{preview['title']}\n\n"
+            f"Beschreibung: {preview['description'] or 'Keine Beschreibung'}\n\n"
+            f"Vorher:\n{before}\n\nNachher:\n{after}\n\n"
+            "Änderung anwenden?"
+        )
+        answer = QMessageBox.question(
+            self,
+            "Quick-Fix-Vorschau",
+            details,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            fix.apply(self)
+            self.setFocus()
 
     def is_in_comment(self, position):
         return any(
@@ -362,6 +613,14 @@ class Editor(QPlainTextEdit):
         )
 
     def keyPressEvent(self, event: QKeyEvent):
+
+        if event.modifiers() == (Qt.ControlModifier | Qt.ShiftModifier) and event.key() == Qt.Key_R:
+            self.rename_symbol()
+            return
+
+        if event.modifiers() == (Qt.ControlModifier | Qt.AltModifier) and event.key() == Qt.Key_M:
+            self.extract_method()
+            return
 
         if (
                 event.key() == Qt.Key_Return
@@ -402,22 +661,51 @@ class Editor(QPlainTextEdit):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             cursor = self.textCursor()
             line = cursor.block().text()
-            indent = ""
+            text = self.toPlainText()
+            position = cursor.position()
+            column = position - cursor.block().position()
 
+            # Einrückung der aktuellen Zeile übernehmen.
+            base_indent = ""
             if self.settings.auto_indent:
-                for c in line:
-                    if c in (" ", "\t"):
-                        indent += c
+                for char in line:
+                    if char in (" ", "\t"):
+                        base_indent += char
                     else:
                         break
 
-                stripped = line.rstrip()
+            indent_unit = " " * max(1, self.settings.tab_size)
 
-                if stripped.endswith(":") or stripped.endswith("{") or stripped.endswith("("):
-                    indent += " " * self.settings.tab_size
+            # Bei { | } eine echte Blockstruktur erzeugen:
+            # öffnende Klammer, eingerückte Leerzeile, schließende Klammer.
+            inside_empty_braces = (
+                not cursor.hasSelection()
+                and position > 0
+                and position < len(text)
+                and text[position - 1] == "{"
+                and text[position] == "}"
+            )
 
             cursor.beginEditBlock()
-            cursor.insertText("\n" + indent)
+            if inside_empty_braces:
+                inner_indent = base_indent + indent_unit
+                insertion_start = cursor.position()
+                cursor.insertText("\n" + inner_indent + "\n" + base_indent)
+                cursor.setPosition(insertion_start + 1 + len(inner_indent))
+            else:
+                before_cursor = line[:column]
+                stripped_before_cursor = before_cursor.rstrip()
+                indent = base_indent
+
+                # Nach Blocköffnern eine Ebene einrücken. Das gilt unter
+                # anderem für class, if, for, while und Methoden in Java.
+                opens_block = stripped_before_cursor.endswith(("{", "(", ":"))
+                if self.settings.auto_indent and opens_block:
+                    indent += indent_unit
+
+                # Wenn der Cursor direkt vor einer schließenden Klammer steht,
+                # bleibt die neue Zeile auf der Ebene des aktuellen Blocks.
+                cursor.insertText("\n" + indent)
             cursor.endEditBlock()
 
             self.setTextCursor(cursor)
@@ -448,6 +736,16 @@ class Editor(QPlainTextEdit):
 
                 cursor.endEditBlock()
                 return
+
+        # Bereits automatisch eingefügte schließende Klammern überspringen,
+        # statt sie beim Tippen ein zweites Mal einzufügen.
+        if event.text() in self.closing_pairs:
+            cursor = self.textCursor()
+            if not cursor.hasSelection() and cursor.position() < len(self.toPlainText()):
+                if self.toPlainText()[cursor.position()] == event.text():
+                    cursor.movePosition(QTextCursor.Right)
+                    self.setTextCursor(cursor)
+                    return
 
         if event.text() in self.opening_pairs or event.text() in ("'", '"'):
             cursor = self.textCursor()
@@ -551,10 +849,14 @@ class Editor(QPlainTextEdit):
         painter = QPainter(self.line_number_area)
         theme = THEMES[self.settings.theme]
 
-        painter.fillRect(event.rect(), QColor(theme["line"]))
+        painter.fillRect(
+            event.rect(),
+            QColor(theme["line"])
+        )
 
         block = self.firstVisibleBlock()
         block_number = block.blockNumber()
+
         top = self.blockBoundingGeometry(
             block
         ).translated(
@@ -562,54 +864,45 @@ class Editor(QPlainTextEdit):
         ).top()
 
         while block.isValid() and top <= event.rect().bottom():
+
             bottom = top + self.blockBoundingRect(block).height()
 
             if block.isVisible():
-                painter.setPen(
-                    QColor(theme["line_number"])
+
+                painter.setPen(QColor(theme["line_number"]))
+
+                painter.drawText(
+                    QRect(
+                        14,
+                        int(top),
+                        self.line_number_area.width() - 20,
+                        int(bottom - top)
+                    ),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    str(block_number + 1)
                 )
 
                 for start, end in self.folding.folds:
                     if start == block_number + 1:
+
                         key = (start, end)
 
                         center_x = 8
-
-                        center_y = int(
-                            top + self.fontMetrics().height() * 1.75
-                        )
+                        center_y = int((top + bottom) / 2)
 
                         size = 5
 
                         if key in self.folded_ranges:
                             points = [
-                                QPoint(
-                                    center_x - 2,
-                                    center_y - size
-                                ),
-                                QPoint(
-                                    center_x - 2,
-                                    center_y + size
-                                ),
-                                QPoint(
-                                    center_x + size,
-                                    center_y
-                                )
+                                QPoint(center_x - 2, center_y - size),
+                                QPoint(center_x - 2, center_y + size),
+                                QPoint(center_x + size, center_y)
                             ]
                         else:
                             points = [
-                                QPoint(
-                                    center_x - size,
-                                    center_y - 2
-                                ),
-                                QPoint(
-                                    center_x + size,
-                                    center_y - 2
-                                ),
-                                QPoint(
-                                    center_x,
-                                    center_y + size
-                                )
+                                QPoint(center_x - size, center_y - 2),
+                                QPoint(center_x + size, center_y - 2),
+                                QPoint(center_x, center_y + size)
                             ]
 
                         painter.setBrush(
@@ -840,23 +1133,22 @@ class Editor(QPlainTextEdit):
         if fold is None:
             return
 
-        start, end = fold
-
         if fold in self.folded_ranges:
-
             self.folded_ranges.remove(fold)
-
-            for number in range(start + 1, end + 1):
-                block = self.document().findBlockByNumber(number - 1)
-
-                if block.isValid():
-                    block.setVisible(True)
-                    block.setLineCount(1)
-
         else:
-
             self.folded_ranges.add(fold)
 
+        self.apply_fold_visibility()
+
+    def apply_fold_visibility(self):
+        block = self.document().begin()
+
+        while block.isValid():
+            block.setVisible(True)
+            block.setLineCount(1)
+            block = block.next()
+
+        for start, end in self.folded_ranges:
             for number in range(start + 1, end + 1):
                 block = self.document().findBlockByNumber(number - 1)
 
@@ -865,8 +1157,7 @@ class Editor(QPlainTextEdit):
                     block.setLineCount(0)
 
         self.document().markContentsDirty(
-            0,
-            self.document().characterCount()
+            0, self.document().characterCount()
         )
 
         self.document().documentLayout().requestUpdate()
@@ -1021,40 +1312,15 @@ class Editor(QPlainTextEdit):
         return state
 
     def restore_fold_state(self, state):
+
         self.folded_ranges.clear()
 
-        block = self.document().begin()
-
-        while block.isValid():
-            block.setVisible(True)
-            block.setLineCount(1)
-            block = block.next()
-
         for fold, fold_id in self.folding.fold_ids.items():
-            if fold_id not in state:
-                continue
 
-            self.folded_ranges.add(fold)
+            if fold_id in state:
+                self.folded_ranges.add(fold)
 
-            start, end = fold
-
-            for block_number in range(start, end):
-                block = self.document().findBlockByNumber(
-                    block_number
-                )
-
-                if block.isValid():
-                    block.setVisible(False)
-                    block.setLineCount(0)
-
-        self.document().markContentsDirty(
-            0,
-            self.document().characterCount()
-        )
-
-        self.update_sticky_lines()
-        self.viewport().update()
-        self.line_number_area.update()
+        self.apply_fold_visibility()
 
     def apply_settings(self):
         self.run_button.setToolTip(self.lang.get("run"))
@@ -1176,6 +1442,7 @@ class Editor(QPlainTextEdit):
             warnings
     ):
         self.analysis_workers.pop(request_id, None)
+        self.analysis_signals.pop(request_id, None)
 
         if request_id != self.analysis_request_id:
             return
@@ -1199,15 +1466,11 @@ class Editor(QPlainTextEdit):
 
         if not is_java:
             try:
+                old_fold_state = self.get_fold_state()
+
                 self.folding.analyze(code)
 
-                valid_folds = set(self.folding.folds)
-
-                self.folded_ranges = {
-                    fold
-                    for fold in self.folded_ranges
-                    if fold in valid_folds
-                }
+                self.restore_fold_state(old_fold_state)
 
             except Exception:
                 pass
@@ -1244,16 +1507,19 @@ class Editor(QPlainTextEdit):
         self.analysis_request_id += 1
         request_id = self.analysis_request_id
 
+        signals = AnalysisSignals()
+        signals.finished.connect(self._analysis_finished)
+
         worker = AnalysisWorker(
             request_id,
             filename,
             text,
-            analyzer
+            analyzer,
+            signals
         )
 
-        worker.signals.finished.connect(self._analysis_finished)
-
         self.analysis_workers[request_id] = worker
+        self.analysis_signals[request_id] = signals
 
         self.analysis_pool.start(worker)
 
@@ -1262,7 +1528,7 @@ class Editor(QPlainTextEdit):
 
         self.setViewportMargins(
             self.line_number_area_width(),
-            28,
+            0,
             minimap_width,
             0
         )
@@ -1366,7 +1632,11 @@ class Editor(QPlainTextEdit):
 
     def line_number_area_width(self):
         digits = len(str(max(1, self.blockCount())))
-        return 12 + self.fontMetrics().horizontalAdvance("9") * digits
+
+        return (
+                24
+                + self.fontMetrics().horizontalAdvance("9") * digits
+        )
 
     def update_error_marks(self):
         selections = []
@@ -1439,32 +1709,44 @@ class Editor(QPlainTextEdit):
 
     def mouseMoveEvent(self, event):
         cursor = self.cursorForPosition(event.pos())
-
         position = cursor.position()
         block = cursor.block()
 
         if not block.isValid():
+            self.quick_fix_popup.hide()
+            self.current_quick_fix_diagnostic = None
+            super().mouseMoveEvent(event)
             return
 
         line = block.blockNumber()
         column = position - block.position()
 
         for diagnostics in (self.errors, self.warnings):
-            for start_line, start_column, end_line, end_column, message in diagnostics:
+            for diagnostic in diagnostics:
+                start_line, start_column, end_line, end_column, message = diagnostic
 
-                if start_line == 0 and start_column == 0 and end_line == 0 and end_column == 0:
+                if start_line == 0 and start_column == 0:
                     continue
 
                 if start_line == end_line == line:
-                    if start_column <= column <= end_column:
-                        self.setToolTip(message)
+                    if start_column <= column <= max(end_column, start_column + 1):
+                        self.show_diagnostic_popup(
+                            diagnostic,
+                            event.globalPosition().toPoint()
+                        )
                         return
 
-        self.setToolTip("")
+        self.quick_fix_popup.hide()
+        self.current_quick_fix_diagnostic = None
+
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event):
         self.setToolTip("")
+
+        if not self.quick_fix_popup.isVisible():
+            self.current_quick_fix_diagnostic = None
+
         super().leaveEvent(event)
 
     def get_completion_context(self):
@@ -1521,66 +1803,73 @@ class Editor(QPlainTextEdit):
         return None, prefix
 
     def show_completion(self):
+
+        if self.is_cursor_in_comment_or_string():
+            self.completion.hide()
+            return
+
         cursor = self.textCursor()
-        line = cursor.block().text()
-        pos = cursor.positionInBlock()
-        before = line[:pos]
 
         context_type, context_prefix = self.get_completion_context()
 
         if context_type:
-            type_name = None
 
-            for name, value in {
-                "str": str,
-                "list": list,
-                "dict": dict,
-                "set": set,
-                "tuple": tuple,
-            }.items():
-                if value is context_type:
-                    type_name = name
-                    break
+            methods = self.model.methods_for_type(context_type)
 
-            if type_name:
-                words = self.model.methods_for_type(type_name)
+            results = [
+                method
+                for method in methods
+                if method.lower().startswith(context_prefix.lower())
+            ]
 
-                words = [
-                    word
-                    for word in words
-                    if word.lower().startswith(context_prefix.lower())
-                ]
-
-                if not words:
-                    self.completion.hide()
-                    return
-
+            if results:
                 self.completion.show_items(
-                    words,
+                    results,
+                    self.cursorRect(),
+                    self
+                )
+            else:
+                self.completion.hide()
+
+            return
+
+        if self.current_file and self.current_file.endswith(".py"):
+
+            results = self.get_jedi_completions()
+
+            if results:
+                self.completion.show_items(
+                    results,
                     self.cursorRect(),
                     self
                 )
                 return
 
-        if before.count('"') % 2 == 1 or before.count("'") % 2 == 1:
-            self.completion.hide()
-            return
-
         prefix = self.current_word()
 
-        self.variable_analyzer.analyze(self.toPlainText())
-        self.model.variables.clear()
-
-        for variable in self.variable_analyzer.completions():
-            self.model.add_variable(variable)
-
-        words = self.model.search(prefix)
-
-        if not words:
+        if not prefix:
             self.completion.hide()
             return
 
-        self.completion.show_items(words, self.cursorRect(), self)
+        self.variable_analyzer.analyze(
+            self.toPlainText()
+        )
+
+        self.model.variables.clear()
+
+        for variable in self.variable_analyzer.variables:
+            self.model.add_variable(variable)
+    
+        results = self.model.search(prefix)
+
+        if results:
+            self.completion.show_items(
+                results,
+                self.cursorRect(),
+                self
+            )
+        else:
+            self.completion.hide()
 
     def setup_autocomplete(self):
         suffix = (
@@ -1589,55 +1878,58 @@ class Editor(QPlainTextEdit):
             else ".py"
         )
 
+        java_words = [
+            "abstract", "assert", "boolean", "break",
+            "byte", "case", "catch", "char", "class",
+            "const", "continue", "default", "do",
+            "double", "else", "enum", "extends",
+            "final", "finally", "float", "for",
+            "if", "implements", "import", "instanceof",
+            "int", "interface", "long", "native",
+            "new", "package", "private", "protected",
+            "public", "return", "short", "static",
+            "strictfp", "super", "switch", "synchronized",
+            "this", "throw", "throws", "transient",
+            "try", "void", "volatile", "while",
+
+            "String", "System", "Object", "Integer",
+            "Double", "Boolean", "Character",
+            "Math", "Scanner", "ArrayList",
+            "HashMap", "HashSet", "List", "Map",
+            "Set", "Collections",
+
+            "println", "print", "printf",
+            "length", "equals", "toString",
+            "charAt", "substring", "contains",
+            "add", "remove", "size", "get", "set",
+
+            "sout", "psvm", "serr"
+        ]
+
+        python_words = [
+            "False", "None", "True", "and", "as",
+            "assert", "async", "await", "break",
+            "class", "continue", "def", "del",
+            "elif", "else", "except", "finally",
+            "for", "from", "global", "if", "import",
+            "in", "is", "lambda", "nonlocal", "not",
+            "or", "pass", "raise", "return", "try",
+            "while", "with", "yield", "print", "input",
+            "len", "range", "open", "list", "dict",
+            "tuple", "set", "int", "float", "str",
+            "bool", "enumerate", "zip", "map",
+            "filter", "sorted", "sum", "min", "max",
+            "abs", "QWidget", "QMainWindow", "QDialog",
+            "QPushButton", "QLabel", "QLineEdit",
+            "QVBoxLayout", "QHBoxLayout",
+            "QGridLayout", "QTimer", "Signal",
+            "self", "__init__"
+        ]
+
         if suffix == ".java":
-            words = [
-                "abstract", "assert", "boolean", "break",
-                "byte", "case", "catch", "char", "class",
-                "const", "continue", "default", "do",
-                "double", "else", "enum", "extends",
-                "final", "finally", "float", "for",
-                "if", "implements", "import", "instanceof",
-                "int", "interface", "long", "native",
-                "new", "package", "private", "protected",
-                "public", "return", "short", "static",
-                "strictfp", "super", "switch", "synchronized",
-                "this", "throw", "throws", "transient",
-                "try", "void", "volatile", "while",
-
-                "String", "System", "Object", "Integer",
-                "Double", "Boolean", "Character",
-                "Math", "Scanner", "ArrayList",
-                "HashMap", "HashSet", "List", "Map",
-                "Set", "Collections",
-
-                "println", "print", "printf",
-                "length", "equals", "toString",
-                "charAt", "substring", "contains",
-                "add", "remove", "size", "get", "set",
-
-                "sout", "psvm", "serr"
-            ]
-
-        elif suffix == ".py":
-            words = [
-                "False", "None", "True", "and", "as",
-                "assert", "async", "await", "break",
-                "class", "continue", "def", "del",
-                "elif", "else", "except", "finally",
-                "for", "from", "global", "if", "import",
-                "in", "is", "lambda", "nonlocal", "not",
-                "or", "pass", "raise", "return", "try",
-                "while", "with", "yield", "print", "input",
-                "len", "range", "open", "list", "dict",
-                "tuple", "set", "int", "float", "str",
-                "bool", "enumerate", "zip", "map",
-                "filter", "sorted", "sum", "min", "max",
-                "abs", "QWidget", "QMainWindow", "QDialog",
-                "QPushButton", "QLabel", "QLineEdit",
-                "QVBoxLayout", "QHBoxLayout",
-                "QGridLayout", "QTimer", "Signal",
-                "self", "__init__"
-            ]
+            words = java_words
+        else:
+            words = python_words
 
         self.model.add_words(words)
 
@@ -1664,16 +1956,20 @@ class Editor(QPlainTextEdit):
             cursor.movePosition(QTextCursor.Left, QTextCursor.MoveAnchor)
 
         elif is_java and word == "psvm":
-            indent = " " * self.settings.tab_size
+            line = cursor.block().text()
+            base_indent = line[:len(line) - len(line.lstrip(" \t"))]
+            inner_indent = base_indent + (" " * max(1, self.settings.tab_size))
+            signature = "public static void main(String[] args) {"
+            insertion_start = cursor.position()
 
+            # Die Methodenkammer wird auf der aktuellen Ebene geschlossen;
+            # der Cursor landet in der eingerückten, leeren Methoden-Zeile.
             cursor.insertText(
-                "public static void main(String[] args) {\n"
-                + indent
-                + "\n}"
+                signature + "\n" + inner_indent + "\n" + base_indent + "}"
             )
-
-            cursor.movePosition(QTextCursor.Up)
-            cursor.movePosition(QTextCursor.EndOfBlock)
+            cursor.setPosition(
+                insertion_start + len(signature) + 1 + len(inner_indent)
+            )
 
         else:
             cursor.insertText(word)
@@ -1687,6 +1983,24 @@ class Editor(QPlainTextEdit):
 
         self.setTextCursor(cursor)
         self.completion.hide()
+
+    def get_jedi_completions(self):
+
+        cursor = self.textCursor()
+
+        source = self.toPlainText()
+
+        line = cursor.blockNumber() + 1
+        column = cursor.positionInBlock()
+
+        path = self.current_file
+
+        return self.python_completion.get_completions(
+            source=source,
+            line=line,
+            column=column,
+            path=path
+        )
 
     def current_word(self):
         cursor = self.textCursor()
@@ -1795,10 +2109,52 @@ class Editor(QPlainTextEdit):
         super().wheelEvent(event)
 
     def paintEvent(self, event):
+
         super().paintEvent(event)
 
         painter = QPainter(self.viewport())
+    
         self.paint_sticky_lines(painter)
+
+        painter.setPen(
+            QColor(THEMES[self.settings.theme]["foreground"])
+        )
+
+        for start, end in self.folded_ranges:
+
+            block = self.document().findBlockByNumber(start - 1)
+
+            if not block.isValid() or not block.isVisible():
+                continue
+
+            rect = self.blockBoundingGeometry(
+                block
+            ).translated(
+                self.contentOffset()
+            )
+
+            if not rect.intersects(self.viewport().rect()):
+                continue
+
+            layout = block.layout()
+
+            if layout is None:
+                continue
+
+            line_text = block.text()
+
+            text_width = self.fontMetrics().horizontalAdvance(
+                line_text
+            )
+
+            x = text_width + 8
+            y = rect.top() + self.fontMetrics().ascent()
+
+            painter.drawText(
+                int(x),
+                int(y),
+                "..."
+            )
 
     def update_language(self, file_path=None):
 

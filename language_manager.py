@@ -1,113 +1,128 @@
+from __future__ import annotations
+
 import json
 import sys
 from pathlib import Path
 
 
 class LanguageManager:
+    """Verwaltet UI-Übersetzungen und Programmiersprachen-Definitionen."""
 
-    def __init__(self, language="en"):
-
+    def __init__(self, language="en", base_path=None):
         self.language = language
         self.data = {}
         self.fallback_data = {}
         self.programming_languages = {}
-
-        if getattr(sys, "frozen", False):
-            self.base_path = (
-                    Path(sys.executable).parent / "_internal"
-            )
-        else:
-            self.base_path = Path(__file__).parent
-
-        # UI-Übersetzungen laden
-        ui_path = self.base_path / "languages" / "ui"
-
-        fallback_path = ui_path / "en.json"
-
-        if fallback_path.is_file():
-            try:
-                self.fallback_data = json.loads(
-                    fallback_path.read_text(
-                        encoding="utf-8"
-                    )
-                )
-            except (json.JSONDecodeError, OSError):
-                self.fallback_data = {}
-
-        lang_path = ui_path / f"{language}.json"
-
-        if lang_path.is_file():
-            try:
-                self.data = json.loads(
-                    lang_path.read_text(
-                        encoding="utf-8"
-                    )
-                )
-            except (json.JSONDecodeError, OSError):
-                self.data = {}
-        else:
-            self.data = self.fallback_data
-
-        # Programmiersprachen separat laden
+        self.base_path = Path(base_path) if base_path else self._get_base_path()
+        self.languages_path = self.base_path / "languages"
+        self.ui_path = self.languages_path / "ui"
+        self.programming_path = self.languages_path / "programming"
+        self.load_ui_language(language)
         self.load_programming_languages()
 
-    def get(self, key):
+    @staticmethod
+    def _get_base_path():
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).resolve().parent
+            internal = exe_dir / "_internal"
+            if internal.is_dir():
+                return internal
+            meipass = getattr(sys, "_MEIPASS", None)
+            return Path(meipass) if meipass else exe_dir
+        return Path(__file__).resolve().parent
 
-        return self.data.get(
-            key,
-            self.fallback_data.get(
-                key,
-                key
+    @staticmethod
+    def _read_json(path):
+        try:
+            with Path(path).open("r", encoding="utf-8") as file:
+                value = json.load(file)
+            return value if isinstance(value, dict) else {}
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+
+    def load_ui_language(self, language=None):
+        if language:
+            self.language = language
+        self.fallback_data = self._read_json(self.ui_path / "en.json")
+        self.data = self._read_json(self.ui_path / f"{self.language}.json")
+        return self.data
+
+    def set_language(self, language):
+        self.load_ui_language(language)
+
+    def get(self, key, default=None, **format_values):
+        value = self.data.get(
+            key, self.fallback_data.get(
+                key, default if default is not None else key
             )
         )
-
-    def get_programming_language(self, extension):
-
-        extension = extension.lower()
-
-        if not extension.startswith("."):
-            extension = "." + extension
-
-        for language in self.programming_languages.values():
-
-            extensions = language.get(
-                "extensions",
-                []
-            )
-
-            if extension in extensions:
-                return language
-
-        return None
+        if isinstance(value, str) and format_values:
+            try:
+                return value.format(**format_values)
+            except (KeyError, ValueError):
+                return value
+        return value
 
     def load_programming_languages(self):
-
         self.programming_languages = {}
+        if not self.programming_path.is_dir():
+            return self.programming_languages
 
-        languages_path = (
-                self.base_path
-                / "languages"
-                / "programming"
-        )
-
-        if not languages_path.is_dir():
-            return
-
-        for file in languages_path.glob("*.json"):
-
-            try:
-                language = json.loads(
-                    file.read_text(
-                        encoding="utf-8"
-                    )
-                )
-
-                name = language.get(
-                    "name",
-                    file.stem
-                )
-
-                self.programming_languages[name] = language
-
-            except (json.JSONDecodeError, OSError):
+        for path in sorted(self.programming_path.glob("*.json")):
+            definition = self._read_json(path)
+            if not definition:
                 continue
+            language_id = str(definition.get("id") or path.stem).lower()
+            name = str(definition.get("name") or path.stem)
+            extensions = definition.get("extensions", [])
+            if isinstance(extensions, str):
+                extensions = [extensions]
+            normalized = []
+            for extension in extensions:
+                extension = str(extension).strip().lower()
+                if extension:
+                    normalized.append(
+                        extension if extension.startswith(".") else "." + extension
+                    )
+            definition.update({
+                "id": language_id,
+                "name": name,
+                "extensions": normalized
+            })
+            self.programming_languages[language_id] = definition
+            self.programming_languages[name.lower()] = definition
+        return self.programming_languages
+
+    def get_programming_language(self, extension):
+        extension = str(extension or "").strip().lower()
+        if not extension:
+            return None
+        if not extension.startswith("."):
+            extension = "." + extension
+        for definition in self.programming_languages.values():
+            if extension in definition.get("extensions", []):
+                return definition
+        return None
+
+    def get_language_id(self, extension):
+        definition = self.get_programming_language(extension)
+        return definition.get("id") if definition else None
+
+    def get_language_name(self, extension):
+        definition = self.get_programming_language(extension)
+        return definition.get("name") if definition else None
+
+    def get_supported_extensions(self):
+        extensions = {
+            ext
+            for definition in self.programming_languages.values()
+            for ext in definition.get("extensions", [])
+        }
+        return sorted(extensions)
+
+    def is_supported(self, extension):
+        return self.get_programming_language(extension) is not None
+
+    def reload(self):
+        self.load_ui_language(self.language)
+        self.load_programming_languages()

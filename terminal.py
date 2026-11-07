@@ -23,6 +23,7 @@ class Terminal(QPlainTextEdit):
         self.process = QProcess(self)
         self.input_start = 0
         self.user_has_input = False
+        self.stop_requested = False
         self.process.readyReadStandardOutput.connect(self.read_stdout)
         self.process.readyReadStandardError.connect(self.read_stderr)
         self.process.finished.connect(self.process_finished)
@@ -100,35 +101,32 @@ class Terminal(QPlainTextEdit):
         suffix = path.suffix.lower()
 
         if suffix not in (".py", ".java"):
-            self.write(
-                "Unsupported file type.\n",
-                error=True
-            )
+            self.write("Unsupported file type.\n", error=True)
             return
 
         if self.process.state() != QProcess.NotRunning:
             self.process.kill()
-            self.process.waitForFinished(1000)
+            self.process.waitForFinished(2000)
+
+        self.stop_requested = False
+        self.java_mode = None
+        self.user_has_input = False
+        self.setReadOnly(False)
 
         self.clear_output()
-
         self.input_start = self.document().characterCount() - 1
-        self.user_has_input = False
 
         if suffix == ".py":
             interpreter = (
-                getattr(self.settings, "python_interpreter", None)
-                or sys.executable
+                    getattr(self.settings, "python_interpreter", None)
+                    or sys.executable
             )
 
             running = self.lang.get("running")
             self.write(f"> {running} {file}...\n")
 
             self.process.setWorkingDirectory(str(path.parent))
-            self.process.start(
-                interpreter,
-                ["-u", str(path)]
-            )
+            self.process.start(interpreter, ["-u", str(path)])
 
         elif suffix == ".java":
             self.run_java(path)
@@ -198,12 +196,20 @@ class Terminal(QPlainTextEdit):
         super().keyPressEvent(event)
 
     def process_error(self, error):
+
         if error == QProcess.FailedToStart:
+            self.stop_requested = False
+            self.java_mode = None
+            self.user_has_input = False
             self.setReadOnly(True)
+
             self.write(
                 f"\n> {self.lang.get('process_start_failed').format(error=self.process.errorString())}\n",
                 error=True
             )
+
+            self.input_start = self.document().characterCount() - 1
+            self.finished.emit()
 
     def read_stderr(self):
         data = self.process.readAllStandardError()
@@ -213,31 +219,51 @@ class Terminal(QPlainTextEdit):
             self.input_start = self.document().characterCount() - 1
 
     def process_finished(self, exit_code=0, exit_status=None):
-        if getattr(self, "java_mode", None) == "compile":
-            if exit_code != 0:
-                self.java_mode = None
 
-                self.write(
-                    "\n> Java compilation failed.\n",
-                    error=True
-                )
+        if self.stop_requested:
+            self.stop_requested = False
+            self.java_mode = None
+            self.user_has_input = False
+            self.setReadOnly(True)
 
-                self.finished.emit()
-                return
+            self.write("\n> Programm wurde gestoppt.\n")
+            self.input_start = self.document().characterCount() - 1
 
-            self.start_java_programm()
+            self.finished.emit()
             return
 
+        if self.java_mode == "compile":
+
+            if exit_code == 0:
+                self.write("\n> Java erfolgreich kompiliert.\n")
+                self.start_java_programm()
+                return
+
+            self.write("\n> Java-Kompilierung fehlgeschlagen.\n", error=True)
+            self.java_mode = None
+
+        else:
+            self.java_mode = None
+
+            self.user_has_input = False
+            self.setReadOnly(True)
+            self.input_start = self.document().characterCount() - 1
+
+            self.write(
+                f"\n> {self.lang.get('process_finished')}\n"
+            )
+
+            self.finished.emit()
+
+    def stop(self):
+        if self.process.state() == QProcess.NotRunning:
+            return
+
+        self.stop_requested = True
         self.java_mode = None
-        self.user_has_input = False
 
-        msg = self.lang.get("process_finished")
-
-        self.setReadOnly(True)
-        self.write(f"\n> {msg}\n")
-
-        self.input_start = self.document().characterCount() - 1
-        self.finished.emit()
+        self.write("\n> Programm wird gestoppt ...\n")
+        self.process.kill()
 
     def reload_language(self):
         self.lang = LanguageManager(self.settings.language)
